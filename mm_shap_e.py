@@ -425,8 +425,12 @@ def main():
     # Initialize the MMShapE model
     print("Initializing MMShapE model...")
 
+    # Fusion modes:
+    #  1 -> Average fusion (not trainable),
+    #  2 -> cross-modal fusion
+
     model = MMShapE(
-        fusion_mode=1,      # Fusion modes: 1 -> Average fusion (not trainable), 2 -> cross-modal fusion
+        fusion_mode=1,      
         latent_dim=1048576,
         reduced_dim=512,
         num_heads=8,
