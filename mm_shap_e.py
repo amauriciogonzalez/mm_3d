@@ -8,7 +8,7 @@ from shap_e.diffusion.gaussian_diffusion import diffusion_from_config
 from shap_e.models.download import load_model, load_config
 from shap_e.util.notebooks import create_pan_cameras, decode_latent_images, decode_latent_mesh, gif_widget, decode_latent_mesh
 from shap_e.util.collections import AttrDict
-#from shap_e.util.image_util import load_image
+from shap_e.util.io import buffered_writer
 from shap_e.models.nn.camera import DifferentiableCameraBatch, DifferentiableProjectiveCamera
 from shap_e.models.transmitter.base import Transmitter, VectorDecoder
 import imageio
@@ -34,6 +34,8 @@ import time
 from typing import Union
 from pprint import pprint
 import matplotlib.pyplot as plt
+import struct
+from typing import BinaryIO, Optional
 
 
 WEIGHTS_DIR = "./weights/"
@@ -610,6 +612,58 @@ def pil_images_to_tensor(list_of_lists):
     return final_tensor
 
 
+def write_ply(
+    raw_f: BinaryIO,
+    coords: np.ndarray,
+    rgb: Optional[np.ndarray] = None,
+    faces: Optional[np.ndarray] = None,
+):
+    """
+    Write a PLY file for a mesh or a point cloud.
+
+    :param coords: an [N x 3] array of floating point coordinates.
+    :param rgb: an [N x 3] array of vertex colors, in the range [0.0, 1.0].
+    :param faces: an [N x 3] array of triangles encoded as integer indices.
+    """
+    with buffered_writer(raw_f) as f:
+        f.write(b"ply\n")
+        f.write(b"format binary_little_endian 1.0\n")
+        f.write(bytes(f"element vertex {len(coords)}\n", "ascii"))
+        f.write(b"property float x\n")
+        f.write(b"property float y\n")
+        f.write(b"property float z\n")
+        if rgb is not None:
+            f.write(b"property uchar red\n")
+            f.write(b"property uchar green\n")
+            f.write(b"property uchar blue\n")
+        if faces is not None:
+            f.write(bytes(f"element face {len(faces)}\n", "ascii"))
+            f.write(b"property list uchar int vertex_index\n")
+        f.write(b"end_header\n")
+
+        if rgb is not None:
+            rgb = (rgb * 255.499).round().astype(int)
+            vertices = [
+                (*coord, *rgb)
+                for coord, rgb in zip(
+                    coords.tolist(),
+                    rgb.tolist(),
+                )
+            ]
+            format = struct.Struct("<3f3B")
+            for item in vertices:
+                f.write(format.pack(*item))
+        else:
+            format = struct.Struct("<3f")
+            for vertex in coords.tolist():
+                f.write(format.pack(*vertex))
+
+        if faces is not None:
+            format = struct.Struct("<B3I")
+            for tri in faces.tolist():
+                f.write(format.pack(len(tri), *tri))
+
+
 def render_voxels_as_images(voxel_tensor, size_of_render=64, num_views=3):
     """
     Render the voxel grid as 2D images by projecting it onto different planes.
@@ -653,6 +707,53 @@ def render_voxels_as_images(voxel_tensor, size_of_render=64, num_views=3):
         images.append(img)
     
     return images
+
+
+
+def voxel_to_mesh(voxel_tensor, output_path='./voxel_mesh_sample.ply'):
+
+    occupancy = voxel_tensor[3] 
+    colors = voxel_tensor[0:3]
+
+    occupancy_np = occupancy.cpu().numpy() 
+    colors_np = colors.cpu().numpy()
+
+    # Binarize the occupancy data if necessary (e.g., threshold at 0.5)
+    occupancy_np = (occupancy_np > 0.5).astype(np.uint8)
+
+    # Perform marching cubes to extract mesh from the occupancy grid
+    vertices, faces, _, _ = measure.marching_cubes(occupancy_np)
+
+    # Swap axes to correct orientation
+    vertices = vertices[:, [2, 1, 0]]
+
+    # Convert the vertices to integers to index the voxel grid for color (after axis swap)
+    vertex_indices = vertices.astype(int)
+
+    # Ensure the indices are within bounds
+    vertex_indices = np.clip(vertex_indices, 0, np.array(colors.shape[1:]) - 1)
+
+    # Now extract RGB colors for each vertex based on the new indices
+    vertex_colors = colors[:, vertex_indices[:, 0], vertex_indices[:, 1], vertex_indices[:, 2]].T
+
+    #vertex_colors = colors[:, [2, 1, 0]].T
+
+    # Normalize vertex_colors to be in range [0.0, 1.0]
+    vertex_colors = vertex_colors / 255.0 if vertex_colors.max() > 1 else vertex_colors
+    vertex_colors = vertex_colors.cpu().numpy()
+
+
+    # Open a binary file for writing
+    with open(output_path, 'wb') as f:
+        # Use the write_ply function to write the mesh
+        write_ply(
+            raw_f=f,
+            coords=vertices,       # Vertex positions (N x 3)
+            rgb=vertex_colors,     # Vertex colors (N x 3) normalized between 0 and 1
+            faces=faces            # Faces (N x 3)
+        )
+
+    print(f"PLY file saved at {output_path}")
 
 
 # ========================================= Loss Functions =========================================
@@ -794,6 +895,10 @@ def train_model(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, devi
 
             if batch_idx == 0 and save_graphic_epoch != 0 and ((epoch + 1) % save_graphic_epoch == 0 or epoch == 0):
                 save_samples_plots(predicted_image_tensors, sample_images, sample_descriptions, epoch)
+            if batch_idx == 0 and epoch == num_epochs - 1:
+                voxel_to_mesh(sample_voxels[0], output_path="./voxel_mesh_sample.ply")
+                fused_latents = fused_latents[0]
+                model.decode_display_save(fused_latents.unsqueeze(0), save_ply=True)
 
             torch.cuda.empty_cache() 
 
