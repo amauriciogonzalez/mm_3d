@@ -25,10 +25,11 @@ from torchvision import transforms, models
 import argparse
 from rembg import remove
 from sklearn.model_selection import train_test_split
+from skimage import measure
+from scipy.ndimage import rotate
 import pandas as pd
 import nrrd  # For reading .nrrd files
 import trimesh # To export meshes
-from skimage import measure
 import nvidia_smi
 import time
 from typing import Union
@@ -36,12 +37,14 @@ from pprint import pprint
 import matplotlib.pyplot as plt
 import struct
 from typing import BinaryIO, Optional
+import random
 
 
 WEIGHTS_DIR = "./weights/"
 
 MODEL_PATHS = {
-    2: WEIGHTS_DIR+"mm_shap_e_crossmodal_attn.pth"
+    1: WEIGHTS_DIR+"mm_shap_e_avg.pth",
+    2: WEIGHTS_DIR+"mm_shap_e_crossmodal_attn.pth",
 }
 
 
@@ -104,7 +107,17 @@ class CrossModalAttention(nn.Module):
 # ========================================= Multimodal Shap-E Pipeline =========================================
 
 class MMShapE(nn.Module):
-    def __init__(self, fusion_mode=2, latent_dim=1048576, reduced_dim=512, num_heads=8, use_transmitter=True, output_path='./output'):
+    def __init__(self,
+                 fusion_mode=2,
+                 use_karras=True,
+                 image_karras_steps=1,
+                 text_karras_steps=16,
+                 latent_dim=1048576,
+                 reduced_dim=512,
+                 num_cm_heads=8,
+                 use_transmitter=True,
+                 output_path='./output'
+                 ):
         super(MMShapE, self).__init__()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -127,10 +140,13 @@ class MMShapE(nn.Module):
         self.diffusion = diffusion_from_config(load_config('diffusion'))
         self.d_latent_dim = latent_dim
         self.d_reduced_dim = reduced_dim
-
-        self._batch_size = 0        # Changes dynamically based on input
         self.text_guidance_scale = 15.0
         self.image_guidance_scale = 3.0
+        self.use_karras = use_karras
+        self.image_karras_steps = image_karras_steps
+        self.text_karras_steps = text_karras_steps
+        self._batch_size = 0        # Changes dynamically based on input
+        
 
         self.output_path = output_path
         self.gif_path = f'{self.output_path}/gifs'
@@ -139,7 +155,7 @@ class MMShapE(nn.Module):
         self._create_directories()
         
         # Initialize cross-modal attention with reduced latent size
-        self.cross_modal_attention = CrossModalAttention(latent_dim=self.d_latent_dim, reduced_dim=self.d_reduced_dim, num_heads=num_heads)
+        self.cross_modal_attention = CrossModalAttention(latent_dim=self.d_latent_dim, reduced_dim=self.d_reduced_dim, num_heads=num_cm_heads)
         
     def _create_directories(self):
         Path(f"{self.output_path}").mkdir(parents=True, exist_ok=True)
@@ -280,11 +296,8 @@ class MMShapE(nn.Module):
             # Generate projections as tensors using the updated decode_latent_images function
             images = self.decode_latent_images_grad(self.xm, latent, orthographic_cameras, rendering_mode=render_mode)
             
-            # Flip the image, and clone to avoid in-place issues
-            flipped_images = torch.flip(images, dims=[-2])  # Flip along the vertical axis (height)
-            
             # Append the tensor (flipped or not) to the list
-            projection_tensors.append(flipped_images)
+            projection_tensors.append(images)
         
         # Stack projections along the batch dimension
         projections_stacked = torch.stack(projection_tensors)
@@ -294,6 +307,15 @@ class MMShapE(nn.Module):
 
         # Permute to match the required shape: [batch_size, num_views, num_channels, height, width]
         projections_permuted_correctly = projections_squeezed.permute(0, 1, 4, 2, 3)  # Adjusting the dimensions
+
+         # Flip the image, and clone to avoid in-place issues
+        projections_permuted_correctly = torch.flip(projections_permuted_correctly, dims=[-2])  # Flip along the vertical axis (height)
+
+        # Swap second and third images (index 1 and 2)
+        #projections_permuted_correctly[:, [1, 2]] = projections_permuted_correctly[:, [2, 1]]
+
+        # Flip the images horizontally (along the width axis)
+        projection_permuted_correctly = torch.flip(projections_permuted_correctly, dims=[-1])
 
         return projections_permuted_correctly
     
@@ -313,11 +335,11 @@ class MMShapE(nn.Module):
             diffusion=self.diffusion,
             guidance_scale=self.image_guidance_scale,
             model_kwargs=dict(images=images),
-            progress=True,
+            progress=False,
             clip_denoised=True,
             use_fp16=True,
-            use_karras=True,
-            karras_steps=64,
+            use_karras=self.use_karras,
+            karras_steps=self.image_karras_steps,
             sigma_min=1e-3,
             sigma_max=160,
             s_churn=0,
@@ -331,11 +353,11 @@ class MMShapE(nn.Module):
             diffusion=self.diffusion,
             guidance_scale=self.text_guidance_scale,
             model_kwargs=dict(texts=prompts),
-            progress=True,
+            progress=False,
             clip_denoised=True,
             use_fp16=True,
-            use_karras=True,
-            karras_steps=64,
+            use_karras=self.use_karras,
+            karras_steps=self.text_karras_steps,
             sigma_min=1e-3,
             sigma_max=160,
             s_churn=0,
@@ -424,7 +446,12 @@ class MMShapE(nn.Module):
         #fused_latents, image_latents, text_latents = self.generate_latents(images, prompts)
         image_latents, text_latents = self.generate_latents(images, prompts)
 
-        fused_latents =  self.cross_modal_attention(image_latents, text_latents)
+        if self.fusion_mode == 1:
+            fused_latents = (0.3 * image_latents) + (0.7 * text_latents)
+        elif self.fusion_mode == 2:
+            fused_latents =  self.cross_modal_attention(image_latents, text_latents)
+        else:
+            raise ValueError(f'Invalid fusion mode: {self.fusion_mode}')
 
         #self.decode_display_save(fused_latents, self.device, prompt, render_mode="nerf")
         
@@ -664,49 +691,106 @@ def write_ply(
                 f.write(format.pack(len(tri), *tri))
 
 
-def render_voxels_as_images(voxel_tensor, size_of_render=64, num_views=3):
+def render_voxels_as_images(voxel_tensor, size_of_render=64, num_views=3, corner_views=False, padding=10):
     """
     Render the voxel grid as 2D images by projecting it onto different planes.
-    
-    :param voxel_tensor: A [C, D, H, W] voxel grid, where C is the number of channels (including RGB)
-    :param num_views: The number of views to generate (default 3 for XY, YZ, XZ views)
+    Only the occupancy is considered for rendering. Adds padding for zoom-out effect.
+
+    :param voxel_tensor: A [C, D, H, W] voxel grid, where C is the number of channels
+    :param num_views: The number of standard views to generate (default 3 for XY, YZ, XZ views)
+    :param corner_views: Whether to include corner views (default True)
+    :param padding: Extra space added around the projection for a zoom-out effect (default 10)
     :return: A list of PIL images
     """
-    # Extract occupancy grid and color channels (assuming the last channel is occupancy, rest are RGB)
     occupancy = voxel_tensor[3]  # Shape: [D, H, W]
-    colors = voxel_tensor[0:3]   # Shape: [3, D, H, W]
 
     images = []
 
-    # Normalize occupancy for rendering (just for visualization purposes)
+    # Normalize occupancy for rendering (0 to 1)
     occupancy_normalized = torch.clamp(occupancy, 0, 1)
     
     # Render different projections (XY, YZ, XZ)
     for axis in range(num_views):
-        # Sum along the axis to create a projection (max to highlight occupied voxels)
+        # Max along the axis to create a projection (highlight occupied voxels)
         projection, _ = torch.max(occupancy_normalized, dim=axis)
         
-        # Handle color channels individually for the projection
-        color_r, _ = torch.max(colors[0], dim=axis)  # Red channel
-        color_g, _ = torch.max(colors[1], dim=axis)  # Green channel
-        color_b, _ = torch.max(colors[2], dim=axis)  # Blue channel
+        # Convert the projection to uint8 format for image
+        projection_image = (projection.cpu().numpy() * 255).astype(np.uint8)
 
-        # Stack the RGB channels along the last dimension (H, W, 3)
-        color_projection_image = torch.stack([color_r, color_g, color_b], dim=-1).cpu().numpy()
-
-        # Convert to uint8 format for image
-        color_projection_image = (color_projection_image * 255).astype(np.uint8)
+        # Add padding (zoom out effect)
+        projection_image = np.pad(projection_image, pad_width=padding, mode='constant', constant_values=0)
 
         # Create a PIL image from the projection
-        img = Image.fromarray(color_projection_image)
-        
+        img = Image.fromarray(projection_image)
+
         # Transformations
         img = img.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
         img = img.resize((size_of_render, size_of_render))
         
         images.append(img)
+
+    # If corner views are requested, generate them by rotating the occupancy grid
+    if corner_views:
+        # Apply corner view rotations
+        rotations = [(30, 45), (-20, 10), (60, 30)]  # Rotation angles (degrees)
+
+        for rot_x, rot_y in rotations:
+            # Rotate the occupancy grid for consistent projection
+            rotated_occupancy = rotate_voxel_grid(occupancy_normalized, rot_x, rot_y)
+            
+            # Project the rotated voxel grid along Z axis (corner view)
+            projection, _ = torch.max(rotated_occupancy, dim=2)
+
+            # Convert to uint8 format for image
+            projection_image = (projection.cpu().numpy() * 255).astype(np.uint8)
+
+            # Add padding (zoom out effect)
+            projection_image = np.pad(projection_image, pad_width=padding, mode='constant', constant_values=0)
+
+            # Create a PIL image from the projection
+            img = Image.fromarray(projection_image)
+
+            # Transformations
+            img = img.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+            img = img.resize((size_of_render, size_of_render))
+            
+            images.append(img)
+
+    # Convert all images to 3-channel images
+    images_3ch = []
+    for img in images:
+        img_3ch = np.stack((np.array(img),) * 3, axis=-1)  # Stack the grayscale image to 3 channels
+        images_3ch.append(Image.fromarray(img_3ch))
+
+    # Flip the last image horizontally
+    if len(images_3ch) > 0:
+        images_3ch[-1] = images_3ch[-1].transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+
+    # Swap the last two images
+    if len(images_3ch) > 1:
+        images_3ch[-1], images_3ch[-2] = images_3ch[-2], images_3ch[-1]
+
+    return images_3ch
+
+
+
+def rotate_voxel_grid(voxel_tensor, angle_x, angle_y):
+    """
+    Rotate the voxel grid around the X and Y axes using the specified angles.
     
-    return images
+    :param voxel_tensor: A [D, H, W] occupancy grid
+    :param angle_x: The angle to rotate around the X axis (in degrees)
+    :param angle_y: The angle to rotate around the Y axis (in degrees)
+    :return: The rotated voxel grid
+    """
+    voxel_numpy = voxel_tensor.cpu().numpy()  # Convert to numpy for scipy rotation
+
+    # Rotate around X axis
+    rotated_x = rotate(voxel_numpy, angle_x, axes=(1, 2), reshape=False, order=1)
+    # Rotate around Y axis
+    rotated_xy = rotate(rotated_x, angle_y, axes=(0, 2), reshape=False, order=1)
+
+    return torch.tensor(rotated_xy)  # Convert back to tensor
 
 
 
@@ -821,6 +905,8 @@ def train_model(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, devi
         num_epochs: Number of training epochs.
         device: Device to run the training on ('cuda' or 'cpu').
     """
+    torch.cuda.empty_cache()
+
     model.train()  # Set the model to training mode
 
     for name, param in model.named_parameters():
@@ -829,11 +915,10 @@ def train_model(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, devi
         else:
             param.requires_grad = False
 
+
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
     print(f'{("="*20)}  TRAINING {("="*20)}')
-
-    torch.autograd.set_detect_anomaly(True)
 
     # Initialize GPU memory tracking
     nvidia_smi.nvmlInit()
@@ -841,11 +926,17 @@ def train_model(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, devi
 
     print(f"GPU MEMORY BEFORE TRAINING: {nvidia_smi.nvmlDeviceGetMemoryInfo(handle).used / 1e6} GB")
 
+    # Initialize variables to store total times for each operation
+    total_latent_time = 0.0
+    total_ortho_time = 0.0
+    total_loss_time = 0.0
+    num_batches = len(dataloader)  # Total number of batches
+
     for epoch in range(num_epochs):
         total_loss = 0.0
         max_gpu_memory = 0  # To track peak GPU memory usage
 
-        start_time = time.time()
+        epoch_start_time = time.time()
 
         for batch_idx, (sample_voxels, sample_descriptions, sample_images) in enumerate(dataloader):
             optimizer.zero_grad()
@@ -858,27 +949,36 @@ def train_model(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, devi
             sample_voxels = sample_voxels.to(device)
             sample_images = sample_images.to(device)
 
-            # Use the last projection image in the sample_images for training
-            # Assuming sample_images is of shape [batch_size, num_views, c, h, w]
-            sample_projection_images = sample_images[:, -1]  # Select the last projection image for each sample (XZ plane)
-            
-            # Forward pass
-            fused_latents, image_latents, text_latents = model.forward(
+            sample_projection_images = sample_images[:, -2]  # Side projection for each sample
+
+            # Measure time for computing latents
+            start_latent_time = time.time()
+            fused_latents, _, _ = model.forward(
                 images=sample_projection_images,
                 prompts=sample_descriptions,
                 remove_background=False
             )
+            end_latent_time = time.time()
+            latent_time = end_latent_time - start_latent_time
+            total_latent_time += latent_time
 
-            # Generate orthographic projections from the fused latents
+            # Measure time for generating orthographic projections
+            start_ortho_time = time.time()
             predicted_image_tensors = model.generate_orthographic_projections_grad(
                 fused_latents,
                 size_of_renders=64,
                 render_mode="nerf"
             )
+            end_ortho_time = time.time()
+            ortho_time = end_ortho_time - start_ortho_time
+            total_ortho_time += ortho_time
 
-
-            # Compute loss
+            # Measure time for computing loss
+            start_loss_time = time.time()
             loss = loss_fn(predicted_image_tensors, sample_images)
+            end_loss_time = time.time()
+            loss_time = end_loss_time - start_loss_time
+            total_loss_time += loss_time
 
             if torch.isnan(loss).any() or torch.isinf(loss).any():
                 print("NaN or Inf detected in loss.")
@@ -887,7 +987,7 @@ def train_model(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, devi
             total_loss += loss.item()
 
             loss.backward()
-            optimizer.step()         
+            optimizer.step()
 
             # Track GPU memory usage during the process
             mem_info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
@@ -900,16 +1000,24 @@ def train_model(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, devi
                 fused_latents = fused_latents[0]
                 model.decode_display_save(fused_latents.unsqueeze(0), save_ply=True)
 
-            torch.cuda.empty_cache() 
+            torch.cuda.empty_cache()
 
         # End of epoch, calculate statistics
-        end_time = time.time()
-        avg_loss = total_loss / len(dataloader)
+        epoch_end_time = time.time()
+        avg_loss = total_loss / num_batches
         max_gpu_memory_MB = max_gpu_memory / 1e6  # Convert to MB
-        total_time = end_time - start_time
-        print(f"Epoch [{epoch + 1}/{num_epochs}], Average Loss: {avg_loss:.4f}, Time: {total_time:.2f}s, Peak GPU Memory: {max_gpu_memory_MB:.2f} MB")
+        total_epoch_time = epoch_end_time - epoch_start_time
+        print(f"Epoch [{epoch + 1}/{num_epochs}], Average Loss: {avg_loss:.4f}, Time: {total_epoch_time:.2f}s, Peak GPU Memory: {max_gpu_memory_MB:.2f} MB")
 
-        
+    # Calculate average times for each operation
+    avg_latent_time = total_latent_time / (num_epochs * num_batches)
+    avg_ortho_time = total_ortho_time / (num_epochs * num_batches)
+    avg_loss_time = total_loss_time / (num_epochs * num_batches)
+
+    print(f"\nAverage time to compute latents: {avg_latent_time:.4f} seconds per batch")
+    print(f"Average time to compute orthographic projections: {avg_ortho_time:.4f} seconds per batch")
+    print(f"Average time to compute loss: {avg_loss_time:.4f} seconds per batch")
+
     # Save model weights at the end of training
     if not os.path.exists(WEIGHTS_DIR):
         os.makedirs(WEIGHTS_DIR)
@@ -923,13 +1031,27 @@ def train_model(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, devi
 
 # Used to test whether or not weights would change after training
 def train_one_epoch_dummy(model, dataloader):
+    torch.cuda.empty_cache() 
+
     # Simple loss function
     criterion = nn.MSELoss()
 
     optimizer = optim.Adam(model.cross_modal_attention.parameters(), lr=1e-4)
 
+    print(("="*20) + " DUMMY TRAINING " + ("="*20))
+
+    start_time = time.time()
+
     model.train()
     total_loss = 0.0
+
+    # Initialize GPU memory tracking
+    nvidia_smi.nvmlInit()
+    handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)  # Assuming using the first GPU
+
+    print(f"GPU MEMORY BEFORE TRAINING: {nvidia_smi.nvmlDeviceGetMemoryInfo(handle).used / 1e6} GB")
+
+    max_gpu_memory = 0  # To track peak GPU memory usage
     
     for batch_idx, (images, prompts, targets) in enumerate(dataloader):
         images = images.to(model.device)
@@ -946,11 +1068,18 @@ def train_one_epoch_dummy(model, dataloader):
         # Backward pass and optimization
         loss.backward()
         optimizer.step()
+
+         # Track GPU memory usage during the process
+        mem_info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
+        max_gpu_memory = max(max_gpu_memory, mem_info.used)
         
         print(f"Batch {batch_idx+1}/{len(dataloader)}: Loss = {loss.item():.4f}")
     
+    end_time = time.time()
     avg_loss = total_loss / len(dataloader)
-    print(f"Average Loss: {avg_loss:.4f}")
+    max_gpu_memory_MB = max_gpu_memory / 1e6  # Convert to MB
+    total_time = end_time - start_time
+    print(f"Average Loss: {avg_loss:.4f}, Time: {total_time:.2f}s, Peak GPU Memory: {max_gpu_memory_MB:.2f} MB")
     
     return avg_loss
 
@@ -970,10 +1099,97 @@ def check_weight_updates(model, dataloader):
     else:
         print("Model weights did not update.")
 
+        
+
 
 
 
 # ========================================= Demo and Display =========================================
+
+def demo_text2shape(model, dataloader, device='cuda', num_samples=2):
+    """
+    Demo function to showcase text-to-shape model results.
+    
+    Args:
+        model: The model to generate results from.
+        dataloader: DataLoader containing the dataset.
+        device: Device to run the demo on ('cuda' or 'cpu').
+        num_samples: Number of samples to demo.
+    """
+    
+    # Record the start time
+    start_time = time.time()
+    
+    model.eval()  # Set the model to evaluation mode
+    num_samples_shown = 0
+
+    # Initialize Nvidia SMI to monitor GPU memory usage
+    nvidia_smi.nvmlInit()
+    handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)  # Assuming using the first GPU
+
+    
+    # Load the randomly selected batch
+    for batch_idx, (sample_voxels, sample_descriptions, sample_images) in enumerate(dataloader):
+        # Move tensors to the specified device
+        sample_images = sample_images.to(device)
+        sample_projection_images = sample_images[:, -2]  # Take the second to last projection image for each sample
+
+        # Calculate latents
+        fused_latents, image_latents, text_latents = model.forward(
+            images=sample_projection_images,
+            prompts=sample_descriptions,
+            remove_background=False
+        )
+        
+        # Generate orthographic projections for fused, image, and text latents
+        with torch.no_grad():
+            predicted_fused_images = model.generate_orthographic_projections_grad(fused_latents, size_of_renders=64, render_mode="nerf")
+            predicted_image_images = model.generate_orthographic_projections_grad(image_latents, size_of_renders=64, render_mode="nerf")
+            predicted_text_images = model.generate_orthographic_projections_grad(text_latents, size_of_renders=64, render_mode="nerf")
+
+
+        # Convert projections to lists of images
+        predicted_image_images = convert_projection_tensors_into_lists(predicted_image_images)
+        predicted_text_images = convert_projection_tensors_into_lists(predicted_text_images)
+        predicted_fused_images = convert_projection_tensors_into_lists(predicted_fused_images)
+        sample_images = convert_projection_tensors_into_lists(sample_images)
+
+        for i in range(num_samples):
+            fig, axs = plt.subplots(4, len(sample_images[i]), figsize=(15, 5))
+
+            for k in range(len(sample_images[i])):
+                axs[0, k].imshow(predicted_image_images[i][k])  
+                axs[0, k].axis('off')  # Hide axes
+                axs[1, k].imshow(predicted_text_images[i][k])  
+                axs[1, k].axis('off')  # Hide axes
+                axs[2, k].imshow(predicted_fused_images[i][k])  
+                axs[2, k].axis('off')  # Hide axes
+                axs[3, k].imshow(sample_images[i][k])  
+                axs[3, k].axis('off')  # Hide axes
+
+            plt.suptitle(sample_descriptions[i], fontsize=16)
+            plt.tight_layout()
+            file_name = f'text2shape_demo_{i}.png'
+            plt.savefig(file_name)
+            plt.close(fig)
+            print(f"Saved {file_name}.")
+
+            num_samples_shown += 1
+
+        if num_samples_shown >= num_samples:
+            break
+    
+    # Monitor GPU memory usage
+    max_gpu_memory = nvidia_smi.nvmlDeviceGetMemoryInfo(handle).used
+    max_gpu_memory_MB = max_gpu_memory / 1e6
+    print(f"Peak GPU Memory: {max_gpu_memory_MB:.2f} MB")
+
+    # Record the end time and calculate total time taken
+    end_time = time.time()
+    total_time = end_time - start_time
+    print(f"Total Time: {total_time:.2f} seconds")
+
+
 
 def demo_from_samples(samples_dir, model, decode_fused_latents=True, decode_image_latents=False, decode_text_latents=False, save_gif=True, save_ply=False, save_obj=False):
     images = []
@@ -1055,6 +1271,7 @@ def main(FLAGS):
     train_loader, test_loader = create_train_test_split(text2shape_dataset, test_size=0.2, batch_size=FLAGS.batch_size, num_samples=FLAGS.n)
 
     # Initialize the MMShapE model
+    start_time = time.time()
     print("Initializing MMShapE model...")
 
     # Fusion modes:
@@ -1062,28 +1279,43 @@ def main(FLAGS):
     #  2 -> cross-modal fusion
 
     model = MMShapE(
-        fusion_mode=FLAGS.mode,      
-        latent_dim=1048576,
-        reduced_dim=512,
-        num_heads=8,
-        use_transmitter=True,
-        output_path="./output"
-        ).to(device)
+                    fusion_mode=FLAGS.mode,
+                    use_karras=True,
+                    image_karras_steps=16,
+                    text_karras_steps=16,
+                    latent_dim=1048576,
+                    #reduced_dim=512,
+                    reduced_dim=1024,
+                    num_cm_heads=8,
+                    use_transmitter=True,
+                    output_path='./output'
+                ).to(device)
+
+
+    if FLAGS.load:
+        print(f"Loading {MODEL_PATHS[FLAGS.mode]} weights...")
+        model.load_state_dict(torch.load(MODEL_PATHS[FLAGS.mode]))
 
     print("Model: ", model)
+    print("--- %s seconds to load MMShapE---" % (time.time() - start_time))
 
     if FLAGS.train:
-        
         #optimizer = optim.Adam(model.parameters(), lr=FLAGS.learning_rate)
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=FLAGS.learning_rate)
-        loss_fn = PerceptualLoss()
-        train_model(model, train_loader, FLAGS.mode, loss_fn, optimizer, num_epochs=FLAGS.epochs, device=device, save_graphic_epoch=5)
+        #optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=FLAGS.learning_rate)
+
+        optimizer = optim.Adam(model.cross_modal_attention.parameters(), lr=FLAGS.learning_rate)
+        #loss_fn = PerceptualLoss()
+        loss_fn = torch.nn.MSELoss()
+        train_model(model, train_loader, FLAGS.mode, loss_fn, optimizer, num_epochs=FLAGS.epochs, device=device, save_graphic_epoch=0)
+
         #dummy_dataset = DummyDataset(num_samples=10)
         #dataloader = DataLoader(dummy_dataset, batch_size=2, shuffle=True)
         #check_weight_updates(model, dataloader)
 
     if FLAGS.demo:
+        """
         # Demo from samples directory. The file names will be considered the text descriptions.
+
         samples_dir = "./samples"
 
         demo_from_samples(samples_dir,
@@ -1094,6 +1326,9 @@ def main(FLAGS):
                             save_gif=True,
                             save_ply=True,
                             save_obj=False)
+        """
+
+        demo_text2shape(model, test_loader, device='cuda', num_samples=FLAGS.n)
     
 
 if __name__ == "__main__":
@@ -1101,6 +1336,9 @@ if __name__ == "__main__":
     parser.add_argument('--mode',
                         type=int, default=1,
                         help="Determines what fusion mode to use")
+    parser.add_argument('--load',
+                        action='store_true',
+                        help='An option to load weights')
     parser.add_argument('--epochs',
                         type=int, default=3,
                         help='Number of epochs to train for.')
