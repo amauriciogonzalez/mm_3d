@@ -27,6 +27,7 @@ from rembg import remove
 from sklearn.model_selection import train_test_split
 from skimage import measure
 from scipy.ndimage import rotate
+from scipy import linalg
 import pandas as pd
 import nrrd  # For reading .nrrd files
 import trimesh # To export meshes
@@ -38,17 +39,19 @@ import matplotlib.pyplot as plt
 import struct
 from typing import BinaryIO, Optional
 import random
-
+from sentence_transformers import SentenceTransformer, util
+from concurrent.futures import ThreadPoolExecutor
+import csv
 
 WEIGHTS_DIR = "./weights/"
 
 MODEL_PATHS = {
-    1: WEIGHTS_DIR+"mm_shap_e_avg.pth",
-    2: WEIGHTS_DIR+"mm_shap_e_crossmodal_attn.pth",
+    2: WEIGHTS_DIR+"mm_shap_e_t2s_crossmodal_attn.pth",
+    20: WEIGHTS_DIR+"mm_shap_e_ov_crossmodal_attn.pth",
 }
 
 
-# ========================================= Model Layers for Multimodal Fusion =========================================
+# ================================================================================== Model Layers for Multimodal Fusion ==================================================================================
 
 class CrossModalAttention(nn.Module):
     def __init__(self, latent_dim, reduced_dim=512, num_heads=8):
@@ -104,59 +107,36 @@ class CrossModalAttention(nn.Module):
         return attn_output_expanded
 
 
-# ========================================= Multimodal Shap-E Pipeline =========================================
+# ================================================================================== Models ==================================================================================
 
-class MMShapE(nn.Module):
+# ========================================= Base Shap-E (to be inherited) =========================================
+
+class BaseShapE(nn.Module):
     def __init__(self,
-                 fusion_mode=2,
-                 use_karras=True,
-                 image_karras_steps=1,
-                 text_karras_steps=16,
-                 latent_dim=1048576,
-                 reduced_dim=512,
-                 num_cm_heads=8,
                  use_transmitter=True,
-                 output_path='./output'
-                 ):
-        super(MMShapE, self).__init__()
+                 output_path='./output'):
+        super(BaseShapE, self).__init__()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        self.fusion_mode = fusion_mode
-        
         if use_transmitter:
-            # Transmitter - the encoder and corresponding projection layers for converting encoder outputs into implicit neural representations.
             self.xm = load_model('transmitter', device=self.device)
         else:
-            # decoder - just the final projection layer component of transmitter. This is a smaller checkpoint than transmitter since it does not
-            # include parameters for encoding 3D assets. This is the minimum required model to convert diffusion outputs into implicit neural representations.
             self.xm = load_model('decoder', device=self.device)
-        
-        # image300M - the image-conditional latent diffusion model.
-        self.image_model = load_model('image300M', device=self.device)
-        
-        # text300M - the text-conditional latent diffusion model.
-        self.text_model = load_model('text300M', device=self.device)
-        
+
+        for param in self.xm.parameters():
+            param.requires_grad = False
+
         self.diffusion = diffusion_from_config(load_config('diffusion'))
-        self.d_latent_dim = latent_dim
-        self.d_reduced_dim = reduced_dim
-        self.text_guidance_scale = 15.0
-        self.image_guidance_scale = 3.0
-        self.use_karras = use_karras
-        self.image_karras_steps = image_karras_steps
-        self.text_karras_steps = text_karras_steps
-        self._batch_size = 0        # Changes dynamically based on input
-        
+
+        self._batch_size = 0    # Changes dynamically based on input
 
         self.output_path = output_path
         self.gif_path = f'{self.output_path}/gifs'
         self.ply_path = f'{self.output_path}/ply_meshes'
         self.obj_path = f'{self.output_path}/obj_meshes'
         self._create_directories()
-        
-        # Initialize cross-modal attention with reduced latent size
-        self.cross_modal_attention = CrossModalAttention(latent_dim=self.d_latent_dim, reduced_dim=self.d_reduced_dim, num_heads=num_cm_heads)
-        
+
+
     def _create_directories(self):
         Path(f"{self.output_path}").mkdir(parents=True, exist_ok=True)
         Path(f"{self.gif_path}").mkdir(parents=True, exist_ok=True)
@@ -303,7 +283,7 @@ class MMShapE(nn.Module):
         projections_stacked = torch.stack(projection_tensors)
 
         # Remove the singleton dimension if necessary (e.g., the second dimension)
-        projections_squeezed = projections_stacked.squeeze(1)  # Assuming you have [batch_size, 1, ...]
+        projections_squeezed = projections_stacked.squeeze(1) 
 
         # Permute to match the required shape: [batch_size, num_views, num_channels, height, width]
         projections_permuted_correctly = projections_squeezed.permute(0, 1, 4, 2, 3)  # Adjusting the dimensions
@@ -311,21 +291,171 @@ class MMShapE(nn.Module):
          # Flip the image, and clone to avoid in-place issues
         projections_permuted_correctly = torch.flip(projections_permuted_correctly, dims=[-2])  # Flip along the vertical axis (height)
 
-        # Swap second and third images (index 1 and 2)
-        #projections_permuted_correctly[:, [1, 2]] = projections_permuted_correctly[:, [2, 1]]
-
         # Flip the images horizontally (along the width axis)
         projection_permuted_correctly = torch.flip(projections_permuted_correctly, dims=[-1])
 
         return projections_permuted_correctly
+
+    def _convert_tensor_batch_to_pil_list(self, image_tensors):
+        pil_images = []
+        for image_tensor in image_tensors:
+            # Convert the tensor image to a PIL image
+            pil_image = transforms.ToPILImage()(image_tensor.cpu())  # Move the image to CPU if it's on a different device
+            pil_images.append(pil_image)
+
+        return pil_images
+
+
+    # Function to take an image and remove the background of an image
+    def _remove_background(self, image, display_image=False, return_tensor=False):
+        # If image is not pil image, convert it from a tensor
+        if isinstance(image, torch.Tensor):
+            image = transforms.ToPILImage()(image)
+
+        # Reshape to (3, 224, 224)
+        image = image.resize((224, 224))
+        
+        
+        # Remove background
+        image_background_removed = remove(image)
+        if display_image:
+            display(image_background_removed)
+            
+        # Convert to RGB if the image has an alpha channel (RGBA)
+        if image_background_removed.mode == 'RGBA':
+            image_background_removed = image_background_removed.convert('RGB')
+        
+        if return_tensor:
+            # Convert image to tensor
+            image_background_removed_tensor = transforms.ToTensor()(image_background_removed)
+            return image_background_removed_tensor
+        else:
+            # Return PIL image
+            return image_background_removed
+
     
-    def average_fusion(self, image_latents, text_latents):
-        # Simple fusion module: averaging the latent spaces
-        return (image_latents + text_latents) / 2
-    
-    def cross_modal_fusion(self, image_latents, text_latents):
-        # Use cross-modal attention instead of averaging
-        return self.cross_modal_attention(image_latents, text_latents)
+
+# ========================================= Shap-E =========================================
+
+class ShapE(BaseShapE):
+    def __init__(self,
+                 input_mode=-1,
+                 use_karras=True,
+                 karras_steps=16,
+                 guidance_scale=15.0,
+                 use_transmitter=True,
+                 output_path='./output'
+                 ):
+        super(ShapE, self).__init__()
+
+        self.input_mode = input_mode
+
+        if self.input_mode == -1:
+            self.latent_diffusion_model = load_model('image300M', device=self.device)
+        elif self.input_mode == -2:
+            self.latent_diffusion_model = load_model('text300M', device=self.device)
+        else:
+            raise ValueError("Choose a valid latent diffusion model mode for Shap-E.")
+
+
+        if use_transmitter:
+            # Transmitter - the encoder and corresponding projection layers for converting encoder outputs into implicit neural representations.
+            self.xm = load_model('transmitter', device=self.device)
+        else:
+            # decoder - just the final projection layer component of transmitter. This is a smaller checkpoint than transmitter since it does not
+            # include parameters for encoding 3D assets. This is the minimum required model to convert diffusion outputs into implicit neural representations.
+            self.xm = load_model('decoder', device=self.device)
+
+        self.use_karras = use_karras
+        self.karras_steps = karras_steps
+        self.guidance_scale = guidance_scale
+
+    def generate_latents(self, inputs):
+        if self.input_mode == -1:
+            model_kwargs = dict(images=inputs)
+        elif self.input_mode == -2:
+            model_kwargs=dict(texts=inputs)
+        
+        latents = sample_latents(
+            batch_size=self._batch_size,
+            model=self.latent_diffusion_model,
+            diffusion=self.diffusion,
+            guidance_scale=self.guidance_scale,
+            model_kwargs=model_kwargs,
+            progress=False,
+            clip_denoised=True,
+            use_fp16=True,
+            use_karras=self.use_karras,
+            karras_steps=self.karras_steps,
+            sigma_min=1e-3,
+            sigma_max=160,
+            s_churn=0,
+        )
+        
+        return latents
+
+
+    def forward(self, inputs, remove_background=False):
+        # Set batch size to the length of the inputs
+        self._batch_size = len(inputs)
+
+        if self.input_mode == -1:
+            # Convert inputs to PIL format if they are tensors
+            if isinstance(inputs[0], torch.Tensor):
+                inputs = self._convert_tensor_batch_to_pil_list(inputs)
+
+            if isinstance(inputs, Image.Image) and remove_background:
+                inputs = [self._remove_background(image) for image in inputs]
+
+        latents = self.generate_latents(inputs)
+        
+        return latents
+
+
+
+# ========================================= Multimodal Shap-E Pipeline =========================================
+
+class MMShapE(BaseShapE):
+    def __init__(self,
+                 fusion_mode=2,
+                 use_karras=True,
+                 image_karras_steps=1,
+                 text_karras_steps=16,
+                 latent_dim=1048576,
+                 reduced_dim=512,
+                 num_cm_heads=8,
+                 use_transmitter=True,
+                 output_path='./output'
+                 ):
+        super(MMShapE, self).__init__()
+
+        self.fusion_mode = fusion_mode
+        
+        # image300M - the image-conditional latent diffusion model.
+        self.image_model = load_model('image300M', device=self.device)
+        for param in self.image_model.parameters():
+            param.requires_grad = False
+        
+        # text300M - the text-conditional latent diffusion model.
+        self.text_model = load_model('text300M', device=self.device)
+        for param in self.text_model.parameters():
+            param.requires_grad = False
+
+        
+        
+        self.diffusion = diffusion_from_config(load_config('diffusion'))
+        self.d_latent_dim = latent_dim
+        self.d_reduced_dim = reduced_dim
+        self.text_guidance_scale = 15.0
+        self.image_guidance_scale = 3.0
+        self.use_karras = use_karras
+        self.image_karras_steps = image_karras_steps
+        self.text_karras_steps = text_karras_steps
+        
+        # Initialize cross-modal attention with reduced latent size
+        self.cross_modal_attention = CrossModalAttention(latent_dim=self.d_latent_dim, reduced_dim=self.d_reduced_dim, num_heads=num_cm_heads)
+
+
 
     def generate_latents(self, images, prompts):
         # Generate image latents
@@ -363,63 +493,57 @@ class MMShapE(nn.Module):
             s_churn=0,
         )
         
-        #print("image_latents: ", image_latents)
-        #print("image_latents shape: ", image_latents.shape)
-        #print("text_latents: ", text_latents)
-        #print("text_latents shape: ", text_latents.shape)
-
-        # Combine latents with fusion module
-        #fused_latents = self.simple_fusion(image_latents, text_latents)
-
-        #if self.fusion_mode == 1:
-        #    fused_latents = self.average_fusion(image_latents, text_latents)
-        #elif self.fusion_mode == 2:
-        #    fused_latents =  self.cross_modal_fusion(image_latents, text_latents)
-        #else:
-        #    raise ValueError(f'Invalid fusion mode: {self.fusion_mode}')
-        
-        #print("fused_latents: ", fused_latents)
-        
-        #return fused_latents, image_latents, text_latents
         return image_latents, text_latents
-
-    def _convert_tensor_batch_to_pil_list(self, image_tensors):
-        pil_images = []
-        for image_tensor in image_tensors:
-            # Convert the tensor image to a PIL image
-            pil_image = transforms.ToPILImage()(image_tensor.cpu())  # Move the image to CPU if it's on a different device
-            pil_images.append(pil_image)
-
-        return pil_images
-
-
-    # Function to take an image and remove the background of an image
-    def _remove_background(self, image, display_image=False, return_tensor=False):
-        # If image is not pil image, convert it from a tensor
-        if isinstance(image, torch.Tensor):
-            image = transforms.ToPILImage()(image)
-
-        # Reshape to (3, 224, 224)
-        image = image.resize((224, 224))
         
-        #print("Image shape: ", image.size)
-        
-        # Remove background
-        image_background_removed = remove(image)
-        if display_image:
-            display(image_background_removed)
-            
-        # Convert to RGB if the image has an alpha channel (RGBA)
-        if image_background_removed.mode == 'RGBA':
-            image_background_removed = image_background_removed.convert('RGB')
-        
-        if return_tensor:
-            # Convert image to tensor
-            image_background_removed_tensor = transforms.ToTensor()(image_background_removed)
-            return image_background_removed_tensor
-        else:
-            # Return PIL image
-            return image_background_removed
+
+    def generate_latents_parallelized(self, images, prompts):
+        # Function to generate image latents
+        def generate_image_latents():
+            return sample_latents(
+                batch_size=self._batch_size,
+                model=self.image_model,
+                diffusion=self.diffusion,
+                guidance_scale=self.image_guidance_scale,
+                model_kwargs=dict(images=images),
+                progress=False,
+                clip_denoised=True,
+                use_fp16=True,
+                use_karras=self.use_karras,
+                karras_steps=self.image_karras_steps,
+                sigma_min=1e-3,
+                sigma_max=160,
+                s_churn=0,
+            )
+
+        # Function to generate text latents
+        def generate_text_latents():
+            return sample_latents(
+                batch_size=self._batch_size,
+                model=self.text_model,
+                diffusion=self.diffusion,
+                guidance_scale=self.text_guidance_scale,
+                model_kwargs=dict(texts=prompts),
+                progress=False,
+                clip_denoised=True,
+                use_fp16=True,
+                use_karras=self.use_karras,
+                karras_steps=self.text_karras_steps,
+                sigma_min=1e-3,
+                sigma_max=160,
+                s_churn=0,
+            )
+
+        # Use ThreadPoolExecutor to run image and text latent generation in parallel
+        with ThreadPoolExecutor() as executor:
+            # Submit both tasks
+            image_future = executor.submit(generate_image_latents)
+            text_future = executor.submit(generate_text_latents)
+
+            # Wait for both tasks to finish and retrieve the results
+            image_latents = image_future.result()
+            text_latents = text_future.result()
+
+        return image_latents, text_latents
         
     
     def forward(self, images, prompts, remove_background=False):
@@ -430,35 +554,28 @@ class MMShapE(nn.Module):
         # Set batch size to the length of the images (or prompts, since they are now guaranteed to be the same length)
         self._batch_size = len(images)
 
-        #print("Image tensors: ", images)
-
         # Convert images to PIL format if they are tensors
         if isinstance(images[0], torch.Tensor):
             images = self._convert_tensor_batch_to_pil_list(images)
 
-        #print("Images after converting tensors to pil: ", images)
 
         if remove_background:
             images = [self._remove_background(image) for image in images]
 
-        #print("Prompts: ", prompts)
-
-        #fused_latents, image_latents, text_latents = self.generate_latents(images, prompts)
+ 
         image_latents, text_latents = self.generate_latents(images, prompts)
 
         if self.fusion_mode == 1:
-            fused_latents = (0.3 * image_latents) + (0.7 * text_latents)
+            fused_latents = (0.5 * image_latents) + (0.5 * text_latents)
         elif self.fusion_mode == 2:
             fused_latents =  self.cross_modal_attention(image_latents, text_latents)
         else:
             raise ValueError(f'Invalid fusion mode: {self.fusion_mode}')
-
-        #self.decode_display_save(fused_latents, self.device, prompt, render_mode="nerf")
         
         return fused_latents, image_latents, text_latents
 
 
-# ========================================== Datasets =========================================
+# =================================================================================== Datasets ==================================================================================
 
 # Just to test if the crossmodal fusion module could be trained
 class DummyDataset(Dataset):
@@ -481,6 +598,8 @@ class DummyDataset(Dataset):
         return image, prompt, target
 
 
+
+# ========================================= Text2Shape =========================================
 
 # Text2Shape Dataset
 class Text2ShapeDataset(Dataset):
@@ -536,7 +655,80 @@ class Text2ShapeDataset(Dataset):
         return voxel_tensor, description, projection_images
 
 
-# ========================================= Dataset Utility Functions =========================================
+# ========================================= Objaverse =========================================
+
+class ObjaverseDataset(Dataset):
+    def __init__(self, image_dir, caption_csv, latent_code_dir, transform=None):
+        """
+        Args:
+            image_dir (str): Directory with rendered images.
+            caption_csv (str): Path to the CSV file containing Object_ID and Caption.
+            latent_code_dir (str): Directory with latent vector codes.
+            transform (callable, optional): Optional transform to be applied on images.
+        """
+        self.image_dir = image_dir
+        self.caption_data = self._load_captions(caption_csv)
+        self.latent_code_dir = latent_code_dir
+        self.transform = transform
+        self.valid_object_ids = self.calculate_valid_object_ids()
+
+    def _load_captions(self, caption_csv):
+        """Load captions from a CSV file and return a dictionary mapping object IDs to captions."""
+        captions = {}
+        with open(caption_csv, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                captions[row['Object_ID']] = row['Caption']
+        return captions
+
+    def calculate_valid_object_ids(self):
+        """Calculate valid object IDs that have images, captions, and latent codes."""
+        valid_object_ids = set()
+        
+        # Iterate through all .pt files in the latent code directory
+        for filename in os.listdir(self.latent_code_dir):
+            if filename.endswith(".pt"):
+                object_id = filename.split(".pt")[0]
+                
+                # Check if both images and captions exist for this object_id
+                image1_path = os.path.join(self.image_dir, f"{object_id}_view_1.png")
+                image2_path = os.path.join(self.image_dir, f"{object_id}_view_2.png")
+                
+                if (object_id in self.caption_data 
+                    and os.path.isfile(image1_path) 
+                    and os.path.isfile(image2_path)):
+                    valid_object_ids.add(object_id)
+
+        return valid_object_ids
+
+    def __len__(self):
+        return len(self.valid_object_ids)
+
+    def __getitem__(self, idx):
+        object_id = list(self.valid_object_ids)[idx]
+
+        # Load images (SHAPES: [3, 400, 400])
+        image1_path = os.path.join(self.image_dir, f"{object_id}_view_1.png")
+        image2_path = os.path.join(self.image_dir, f"{object_id}_view_2.png")
+        image1 = Image.open(image1_path).convert('RGB')
+        image2 = Image.open(image2_path).convert('RGB')
+
+        # Apply any specified transformations to the images
+        if self.transform:
+            image1 = self.transform(image1)
+            image2 = self.transform(image2)
+
+        # Load caption
+        caption = self.caption_data[object_id]
+
+        # Load latent code
+        latent_code_path = os.path.join(self.latent_code_dir, f"{object_id}.pt")
+        latent_code = torch.load(latent_code_path)
+
+        return image1, image2, caption, latent_code
+
+
+# ================================================================================== Dataset Utility Functions ==================================================================================
 
 def create_train_test_split(dataset, test_size=0.2, batch_size=8, num_samples=0):
     """
@@ -573,6 +765,8 @@ def create_train_test_split(dataset, test_size=0.2, batch_size=8, num_samples=0)
     test_loader = DataLoader(test_subset, batch_size=batch_size, shuffle=False, pin_memory=True)
 
     return train_loader, test_loader
+
+
 
 
 def convert_projection_tensors_into_lists(projection_images):
@@ -762,14 +956,6 @@ def render_voxels_as_images(voxel_tensor, size_of_render=64, num_views=3, corner
         img_3ch = np.stack((np.array(img),) * 3, axis=-1)  # Stack the grayscale image to 3 channels
         images_3ch.append(Image.fromarray(img_3ch))
 
-    # Flip the last image horizontally
-    if len(images_3ch) > 0:
-        images_3ch[-1] = images_3ch[-1].transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-
-    # Swap the last two images
-    if len(images_3ch) > 1:
-        images_3ch[-1], images_3ch[-2] = images_3ch[-2], images_3ch[-1]
-
     return images_3ch
 
 
@@ -840,7 +1026,7 @@ def voxel_to_mesh(voxel_tensor, output_path='./voxel_mesh_sample.ply'):
     print(f"PLY file saved at {output_path}")
 
 
-# ========================================= Loss Functions =========================================
+# ================================================================================== Loss Functions ==================================================================================
 
 # To compute perceptual similarity loss between the ground truth and predicted images, we can leverage a model pre-trained
 # on image classification tasks that captures semantic features—typically a variant of the VGG network works well for this purpose.
@@ -890,9 +1076,11 @@ class PerceptualLoss(nn.Module):
         return loss
 
 
-# ========================================= Training =========================================
+# ================================================================================== Training ==================================================================================
 
-def train_model(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, device='cuda', save_graphic_epoch=0):
+# ========================================= Training with Text2Shape =========================================
+
+def train_model_text2shape(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, device='cuda', save_graphic_epoch=0):
     """
     Train the model using the provided dataset and parameters.
     
@@ -916,7 +1104,7 @@ def train_model(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, devi
             param.requires_grad = False
 
 
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    #torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
     print(f'{("="*20)}  TRAINING {("="*20)}')
 
@@ -949,7 +1137,7 @@ def train_model(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, devi
             sample_voxels = sample_voxels.to(device)
             sample_images = sample_images.to(device)
 
-            sample_projection_images = sample_images[:, -2]  # Side projection for each sample
+            sample_projection_images = sample_images[:, -1]  # Side projection for each sample
 
             # Measure time for computing latents
             start_latent_time = time.time()
@@ -1023,6 +1211,105 @@ def train_model(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, devi
         os.makedirs(WEIGHTS_DIR)
     torch.save(model.state_dict(), MODEL_PATHS[mode])
     print(f"Model saved at {MODEL_PATHS[mode]}.")
+
+
+# ========================================= Training with Objaverse =========================================
+
+def train_model_objaverse(model, dataloader, mode, loss_fn, optimizer, num_epochs=10, device='cuda'):
+    """
+    Train the model using the provided dataset and parameters.
+    
+    Args:
+        model: The model to be trained.
+        dataloader: DataLoader for the dataset.
+        mode: The fusion mode used to save the model weights accordingly.
+        loss_fn: Loss function to optimize.
+        optimizer: Optimizer for updating model parameters.
+        num_epochs: Number of training epochs.
+        device: Device to run the training on ('cuda' or 'cpu').
+    """
+    torch.cuda.empty_cache()
+
+    model.train()  # Set the model to training mode
+
+    print(f'{("="*20)}  TRAINING {("="*20)}')
+    print(f'Number of training samples: {len(dataloader.dataset)}')
+
+    # Initialize GPU memory tracking
+    nvidia_smi.nvmlInit()
+    handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)  # Assuming using the first GPU
+
+    print(f"GPU MEMORY BEFORE TRAINING: {nvidia_smi.nvmlDeviceGetMemoryInfo(handle).used / 1e6} GB")
+
+    total_latent_time = 0.0
+    total_loss_time = 0.0
+    num_batches = len(dataloader)  # Total number of batches
+
+    for epoch in range(num_epochs):
+        total_loss = 0.0
+        max_gpu_memory = 0  # To track peak GPU memory usage
+
+        epoch_start_time = time.time()
+
+        for batch_idx, (images1, images2, captions, latent_codes) in enumerate(dataloader):
+            optimizer.zero_grad()
+
+            # images1 is not used for now.
+
+            # Move tensors to the specified device
+            images2 = images2.to(device)
+            latent_codes = latent_codes.to(device)
+
+            # Measure time for computing latents
+            start_latent_time = time.time()
+            fused_latents, _, _ = model.forward(
+                images=images2,
+                prompts=captions,
+                remove_background=False
+            )
+            end_latent_time = time.time()
+            latent_time = end_latent_time - start_latent_time
+            total_latent_time += latent_time
+
+
+            # Measure time for computing loss
+            start_loss_time = time.time()
+            latent_codes = latent_codes.squeeze(1)  # Removes the dimension with size 1
+            loss = loss_fn(fused_latents, latent_codes)
+            end_loss_time = time.time()
+            loss_time = end_loss_time - start_loss_time
+            total_loss_time += loss_time
+
+            total_loss += loss.item()
+
+            loss.backward()
+            optimizer.step()
+
+            # Track GPU memory usage during the process
+            mem_info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
+            max_gpu_memory = max(max_gpu_memory, mem_info.used)
+
+            torch.cuda.empty_cache()
+
+        # End of epoch, calculate statistics
+        epoch_end_time = time.time()
+        avg_loss = total_loss / num_batches
+        max_gpu_memory_MB = max_gpu_memory / 1e6  # Convert to MB
+        total_epoch_time = epoch_end_time - epoch_start_time
+        print(f"Epoch [{epoch + 1}/{num_epochs}], Average Loss: {avg_loss:.4f}, Time: {total_epoch_time:.2f}s, Peak GPU Memory: {max_gpu_memory_MB:.2f} MB")
+
+    # Calculate average times for each operation
+    avg_latent_time = total_latent_time / (num_epochs * num_batches)
+    avg_loss_time = total_loss_time / (num_epochs * num_batches)
+
+    print(f"\nAverage time to compute latents: {avg_latent_time:.4f} seconds per batch")
+    print(f"Average time to compute loss: {avg_loss_time:.4f} seconds per batch")
+
+    # Save model weights at the end of training
+    if not os.path.exists(WEIGHTS_DIR):
+        os.makedirs(WEIGHTS_DIR)
+    torch.save(model.state_dict(), MODEL_PATHS[mode*10])
+    print(f"Model saved at {MODEL_PATHS[mode*10]}.")
 
 
 
@@ -1099,12 +1386,205 @@ def check_weight_updates(model, dataloader):
     else:
         print("Model weights did not update.")
 
+
+
+
+
+# ================================================================================== Evaluation ==================================================================================
+
+def evaluate_text2shape(model, dataloader, device='cuda', fid_batch_size=30):
+    """
+    Evaluate a text-to-shape model using FID and CLIP-R precision.
+    
+    Args:
+        model: The pre-trained text-to-shape model to be evaluated.
+        dataloader: DataLoader containing the dataset with real image tensors.
+        device: Device to run the evaluation on ('cuda' or 'cpu').
+        batch_size: Number of images to process in a batch for FID calculation.
+    
+    Returns:
+        fid_value: Computed FID score between real and generated images.
+        average_clip_r: Computed CLIP-R precision.
+    """
+    model.eval()
+
+    # FID Prereqs
+    real_image_batches = []
+    generated_image_batches = []
+    fid_preprocess = transforms.Compose([
+        transforms.Resize((299, 299)),
+        #transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    # CLIP-R Precision Prereqs
+    clip_model = SentenceTransformer("clip-ViT-B-32")
+
+    # Initialize Nvidia SMI to monitor GPU memory usage
+    nvidia_smi.nvmlInit()
+    handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)  # Assuming using the first GPU
+
+
+    start_time = time.time()  # Start timing
+
+    all_descriptions = []
+    for batch_idx, (sample_voxels, sample_descriptions, sample_images) in enumerate(dataloader):
+        # Move tensors to the specified device
+        sample_voxels = sample_voxels.to(device)
+        sample_images = sample_images.to(device)
+        sample_projection_images = sample_images[:, -1]  # Side projection for each sample
+
+        # Generate the 3D projections
+        with torch.no_grad():
+            if isinstance(model, MMShapE):
+                latents, _, _ = model.forward(images=sample_projection_images, prompts=sample_descriptions, remove_background=False)
+            elif isinstance(model, ShapE):
+                if model.input_mode == -1:
+                    inputs = sample_projection_images
+                elif model.input_mode == -2:
+                    inputs = sample_descriptions
+                else:
+                    raise ValueError("Choose a valid ShapE input mode.")
+                latents = model.forward(inputs=inputs)
+
+            predicted_image_tensors = model.generate_orthographic_projections_grad(latents, size_of_renders=64, render_mode="nerf")
+
+        # Collect real and generated image tensors for FID calculation
+        real_image_batches.append(sample_images.detach().cpu())
+        generated_image_batches.append(predicted_image_tensors.detach().cpu())
+
+        all_descriptions = all_descriptions + sample_descriptions
+
+        # Compute CLIP-R Precision for the current batch
+        #clip_r_batch = compute_clip_r_precision(clip_model, predicted_image_tensors, sample_descriptions)
+        #print(f"Batch {batch_idx + 1} CLIP-R Precision: {clip_r_batch:.4f}")
+
+
+    max_gpu_memory = nvidia_smi.nvmlDeviceGetMemoryInfo(handle).used
+    max_gpu_memory_MB = max_gpu_memory / 1e6
+    print(f"GPU Memory: {max_gpu_memory_MB:.2f} MB")
+
+    time_taken = time.time() - start_time
+    print(f"Time taken: {time_taken/60:.4f} minutes")
+
+    # Concatenate all batches
+    real_images = torch.cat(real_image_batches)
+    batch_size, num_views, num_channels, height, width = real_images.shape
+    real_images = real_images.view(batch_size * num_views, num_channels, height, width)
+
+    generated_images = torch.cat(generated_image_batches)
+    batch_size, num_views, num_channels, height, width = generated_images.shape
+    generated_images = generated_images.view(batch_size * num_views, num_channels, height, width)
+
+    # Preprocess images for FID calculation
+    real_images_fid = torch.stack([fid_preprocess(img) for img in real_images])
+    generated_images_fid = torch.stack([fid_preprocess(img) for img in generated_images])
+
+    # Compute FID between real and generated images
+    fid_value = compute_fid(real_images_fid, generated_images_fid, batch_size=fid_batch_size, cuda=(device == 'cuda'))
+    print(f"FID score: {fid_value:.4f}")
+
+    # Calculate overall CLIP-R Precision
+    average_clip_r = compute_clip_r_precision(clip_model, generated_images, all_descriptions)
+    
+    print(f"Overall CLIP-R Precision: {average_clip_r:.4f}")
+
+    return fid_value, average_clip_r
+
+
+
+
+# ========================================= FID =========================================
+
+def get_inception_model(cuda=True):
+    """Load pre-trained InceptionV3 model for FID calculation."""
+    model = models.inception_v3(pretrained=True, transform_input=False)
+    model.fc = torch.nn.Identity()  # Remove final classification layer
+    if cuda:
+        model.cuda()
+    model.eval()
+    return model
+
+def get_activations(images, model, batch_size=50, dims=2048, cuda=True):
+    """Calculate activations of the pool_3 layer for all images."""
+    model.eval()
+    if batch_size > len(images):
+        batch_size = len(images)
+
+    pred_arr = np.empty((len(images), dims))
+    
+    for i in range(0, len(images), batch_size):
+        batch = images[i:i + batch_size]
+        if cuda:
+            batch = batch.cuda()
+        with torch.no_grad():
+            pred = model(batch)
+
+        pred_arr[i:i + batch_size] = pred.cpu().numpy()
+
+    return pred_arr
+
+def calculate_activation_statistics(images, model, batch_size=50, dims=2048, cuda=True):
+    """Calculate the mean and covariance of activations."""
+    act = get_activations(images, model, batch_size, dims, cuda)
+    mu = np.mean(act, axis=0)
+    sigma = np.cov(act, rowvar=False)
+    return mu, sigma
+
+def calculate_frechet_distance(mu1, sigma1, mu2, sigma2, eps=1e-6):
+    """Calculate Frechet Distance between two Gaussians."""
+    diff = mu1 - mu2
+    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    if not np.isfinite(covmean).all():
+        covmean = linalg.sqrtm((sigma1 + eps * np.eye(sigma1.shape[0])).dot(sigma2 + eps * np.eye(sigma2.shape[0])))
+
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    tr_covmean = np.trace(covmean)
+    return (diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * tr_covmean)
+
+def compute_fid(real_images, generated_images, batch_size, cuda=True, dims=2048):
+    """Compute FID between two sets of images."""
+    model = get_inception_model(cuda)
+    mu1, sigma1 = calculate_activation_statistics(real_images, model, batch_size, dims, cuda)
+    mu2, sigma2 = calculate_activation_statistics(generated_images, model, batch_size, dims, cuda)
+    fid_value = calculate_frechet_distance(mu1, sigma1, mu2, sigma2)
+    return fid_value
+
+
+
+
+# ========================================= CLIP-R Precision =========================================
+
+
+def compute_clip_r_precision(model, generated_images, text_prompts):
+    """Calculate CLIP-R precision for the generated images."""
+    all_cosine_scores = []
+
+    for img_tensor, text in zip(generated_images, text_prompts):
+        # Convert tensor to PIL Image
+        image_pil = transforms.ToPILImage()(img_tensor)
+        
+        # Encode the image and text
+        img_emb = model.encode([image_pil])
+        text_emb = model.encode([text])
+        
+        # Compute cosine similarity
+        cos_score = util.cos_sim(img_emb, text_emb)
+        all_cosine_scores.append(cos_score[0][0].cpu().numpy())
+    
+    # Calculate the average cosine similarity (CLIP-R Precision)
+    average_clip_r = np.mean(all_cosine_scores)
+
+    return average_clip_r
         
 
 
 
 
-# ========================================= Demo and Display =========================================
+# ================================================================================== Demo and Display ==================================================================================
+
+# ========================================= Text2Shape Demo =========================================
 
 def demo_text2shape(model, dataloader, device='cuda', num_samples=2):
     """
@@ -1132,7 +1612,7 @@ def demo_text2shape(model, dataloader, device='cuda', num_samples=2):
     for batch_idx, (sample_voxels, sample_descriptions, sample_images) in enumerate(dataloader):
         # Move tensors to the specified device
         sample_images = sample_images.to(device)
-        sample_projection_images = sample_images[:, -2]  # Take the second to last projection image for each sample
+        sample_projection_images = sample_images[:, -1]  # Take the last projection image for each sample
 
         # Calculate latents
         fused_latents, image_latents, text_latents = model.forward(
@@ -1191,37 +1671,6 @@ def demo_text2shape(model, dataloader, device='cuda', num_samples=2):
 
 
 
-def demo_from_samples(samples_dir, model, decode_fused_latents=True, decode_image_latents=False, decode_text_latents=False, save_gif=True, save_ply=False, save_obj=False):
-    images = []
-    file_names = []
-
-    # Iterate over each file in the samples_dir
-    for filename in os.listdir(samples_dir):
-        # Construct the full file path
-        file_path = os.path.join(samples_dir, filename)
-        
-        # Check if it is a file and ends with an image extension
-        if os.path.isfile(file_path) and filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
-            # Open the image and append to the images list
-            image = Image.open(file_path)
-            images.append(image)
-            # Append the filename (without extension) to the file_names list
-            file_names.append(os.path.splitext(filename)[0])
-
-    fused_latents, image_latents, text_latents = model(images, file_names, remove_background=True)
-
-    if decode_fused_latents:
-        model.decode_display_save(fused_latents, file_names, save_gif=save_gif, display_gif=False, gif_fps=10, save_ply=save_ply, save_obj=save_obj, render_mode="nerf", size_of_renders=64)
-
-    if decode_image_latents:
-        file_names_from_image = [file_name + "_from_image" for file_name in file_names]
-        model.decode_display_save(image_latents, file_names_from_image, save_gif=save_gif, display_gif=False, gif_fps=10, save_ply=save_ply, save_obj=save_obj, render_mode="nerf", size_of_renders=64)
-
-    if decode_text_latents:
-        file_names_from_text = [file_name + "_from_text" for file_name in file_names]
-        model.decode_display_save(text_latents, file_names_from_text, save_gif=save_gif, display_gif=False, gif_fps=10, save_ply=save_ply, save_obj=save_obj, render_mode="nerf", size_of_renders=64)
-
-
 def save_samples_plots(predicted_images, target_images, descriptions, epoch):
     """
     Save the plots of the predictions and descriptions.
@@ -1257,60 +1706,246 @@ def save_samples_plots(predicted_images, target_images, descriptions, epoch):
 
 
 
-# ========================================= Main =========================================
+
+# ========================================= Objaverse Demo =========================================
+
+def demo_objaverse(model, dataloader, device, output_dir='./output/demos/'):
+    """
+    Demonstrates the model's predictions on a given number of samples from the test set.
+
+    Args:
+        model: The trained model to be evaluated.
+        dataloader: DataLoader for the test set.
+        device: Device to run the inference on ('cuda' or 'cpu').
+        n: Number of samples to plot/demo before exiting the function.
+        output_dir: Directory to save the generated GIFs.
+    """
+    # Create output directory if it does not exist
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    model.eval()  # Set the model to evaluation mode
+
+    cameras = create_pan_cameras(64, model.device)
+    
+    with torch.no_grad():
+        for i, (images1, images2, captions, latent_codes) in enumerate(dataloader):
+
+            # Move tensors to the specified device
+            images2 = images2.to(device)
+            latent_codes = latent_codes.to(device)
+
+
+            # Get the predicted fused latents from the model
+            fused_latents, _, _ = model.forward(
+                images=images2,
+                prompts=captions,
+                remove_background=False
+            )
+
+            for j, fused_latent in enumerate(fused_latents):
+                gt_gif_path = model.gif_path + '/' + f'sample_{i}_gt.gif'
+                pred_gif_path = model.gif_path + '/' + f'sample_{i}_pred.gif'
+
+                gt_images = decode_latent_images(model.xm, fused_latent, cameras, rendering_mode='nerf')
+                pred_images = decode_latent_images(model.xm, latent_codes[j], cameras, rendering_mode='nerf')
+
+                imageio.mimsave(gt_gif_path, gt_images, fps=10)  
+                imageio.mimsave(pred_gif_path, pred_images, fps=10)  
+                
+                 # Plotting
+                fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+                fig.suptitle(captions[j], fontsize=10)  # Use the first caption as the title for simplicity
+
+                # Input image
+                axs[0].imshow(images2[j].cpu().permute(1, 2, 0))  # Assuming images2 is a batch of tensors with shape (N, C, H, W)
+                axs[0].set_title("Input Image")
+                axs[0].axis('off')
+
+                # Prepare placeholders for the animated images
+                gt_im = axs[1].imshow(gt_images[0])
+                pred_im = axs[2].imshow(pred_images[0])
+                axs[1].set_title("Ground Truth")
+                axs[1].axis('off')
+                axs[2].set_title("Predicted")
+                axs[2].axis('off')
+
+                # Animation function
+                def update(frame):
+                    gt_im.set_array(gt_images[frame])
+                    pred_im.set_array(pred_images[frame])
+                    return [gt_im, pred_im]
+
+                # Create the animation
+                ani = FuncAnimation(fig, update, frames=len(gt_images), interval=200, blit=True)
+
+                # Save the animated plot as a GIF
+                gif_path = os.path.join(output_dir, f'sample_{i}_comparison.gif')
+                ani.save(gif_path, writer=PillowWriter(fps=10))
+                print(f"Saved animated comparison plot for sample {i} at {gif_path}")
+
+                # Close the plot to free memory
+                plt.close()
+
+
+# ========================================= General Demos =========================================
+
+def demo_from_samples(samples_dir, model, decode_fused_latents=True, decode_image_latents=False, decode_text_latents=False, save_gif=True, save_ply=False, save_obj=False):
+    images = []
+    file_names = []
+
+    # Iterate over each file in the samples_dir
+    for filename in os.listdir(samples_dir):
+        # Construct the full file path
+        file_path = os.path.join(samples_dir, filename)
+        
+        # Check if it is a file and ends with an image extension
+        if os.path.isfile(file_path) and filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
+            # Open the image and append to the images list
+            image = Image.open(file_path)
+            images.append(image)
+            # Append the filename (without extension) to the file_names list
+            file_names.append(os.path.splitext(filename)[0])
+
+    fused_latents, image_latents, text_latents = model(images, file_names, remove_background=True)
+
+    if decode_fused_latents:
+        model.decode_display_save(fused_latents, file_names, save_gif=save_gif, display_gif=False, gif_fps=10, save_ply=save_ply, save_obj=save_obj, render_mode="nerf", size_of_renders=64)
+
+    if decode_image_latents:
+        file_names_from_image = [file_name + "_from_image" for file_name in file_names]
+        model.decode_display_save(image_latents, file_names_from_image, save_gif=save_gif, display_gif=False, gif_fps=10, save_ply=save_ply, save_obj=save_obj, render_mode="nerf", size_of_renders=64)
+
+    if decode_text_latents:
+        file_names_from_text = [file_name + "_from_text" for file_name in file_names]
+        model.decode_display_save(text_latents, file_names_from_text, save_gif=save_gif, display_gif=False, gif_fps=10, save_ply=save_ply, save_obj=save_obj, render_mode="nerf", size_of_renders=64)
+
+
+
+
+# ================================================================================== Main ==================================================================================
 
 def main(FLAGS):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    print("Initializing dataset...")
+    # ================= Initializing the dataset ================= 
+    if FLAGS.dataset == 'text2shape':
+        print("Initializing Text2Shape...")
 
-    # Instantiate the dataset
-    dataset_dir = "./text2shape/nrrd_256_filter_div_32/nrrd_256_filter_div_32"
-    csv_dir = "./text2shape/captions.tablechair.csv"
-    text2shape_dataset = Text2ShapeDataset(dataset_dir=dataset_dir, csv_path=csv_dir)
-    train_loader, test_loader = create_train_test_split(text2shape_dataset, test_size=0.2, batch_size=FLAGS.batch_size, num_samples=FLAGS.n)
+        dataset_dir = "./text2shape/nrrd_256_filter_div_32/nrrd_256_filter_div_32"
+        csv_dir = "./text2shape/captions.tablechair.csv"
+        dataset = Text2ShapeDataset(dataset_dir=dataset_dir, csv_path=csv_dir)
+    elif FLAGS.dataset == 'objaverse':
+        print("Initializing Objaverse...")
 
-    # Initialize the MMShapE model
+        image_dir = "/lustre/fs1/home/cap6411.student4/Project/mvs_objaverse/Objaverse_Dataset/rendered_images/"
+        caption_csv = "/lustre/fs1/home/cap6411.student4/Project/mvs_objaverse/objaverse_csv.csv"
+        latent_code_dir = "/lustre/fs1/home/cap6411.student3/final_project/Cap3D/Cap3D_latentcodes/"
+        transform = transforms.ToTensor()
+
+        dataset = ObjaverseDataset(
+            image_dir=image_dir,
+            caption_csv=caption_csv,
+            latent_code_dir=latent_code_dir,
+            transform=transform
+        )
+    else:
+        raise ValueError(f"Invalid Dataset: {FLAGS.dataset}")
+
+    train_loader, test_loader = create_train_test_split(dataset, test_size=0.2, batch_size=FLAGS.batch_size, num_samples=FLAGS.n)
+
+
+
+
+    # ================= Initializing the model ================= 
     start_time = time.time()
-    print("Initializing MMShapE model...")
+    if FLAGS.mode < 0:
+        print("Initializing ShapE model...")
 
-    # Fusion modes:
-    #  1 -> Average fusion (not trainable),
-    #  2 -> cross-modal fusion
+        # Input modes:
+        #  -1 -> Image inputs,
+        #  -2 -> Text inputs
 
-    model = MMShapE(
-                    fusion_mode=FLAGS.mode,
-                    use_karras=True,
-                    image_karras_steps=16,
-                    text_karras_steps=16,
-                    latent_dim=1048576,
-                    #reduced_dim=512,
-                    reduced_dim=1024,
-                    num_cm_heads=8,
-                    use_transmitter=True,
-                    output_path='./output'
-                ).to(device)
+        model = ShapE(
+                        input_mode=FLAGS.mode,
+                        use_karras=True,
+                        karras_steps=16,
+                        guidance_scale=15.0,
+                        use_transmitter=True,
+                        output_path='./output'
+                    ).to(device)
+
+    else:
+        print("Initializing MMShapE model...")
+
+        # Fusion modes:
+        #  1 -> Average fusion (not trainable),
+        #  2 -> cross-modal fusion
+
+        model = MMShapE(
+                        fusion_mode=FLAGS.mode,
+                        use_karras=True,
+                        image_karras_steps=16,
+                        text_karras_steps=16,
+                        latent_dim=1048576,
+                        #reduced_dim=512,
+                        reduced_dim=1024,
+                        num_cm_heads=8,
+                        use_transmitter=True,
+                        output_path='./output'
+                    ).to(device)
 
 
-    if FLAGS.load:
-        print(f"Loading {MODEL_PATHS[FLAGS.mode]} weights...")
-        model.load_state_dict(torch.load(MODEL_PATHS[FLAGS.mode]))
+        if FLAGS.load:
+            if FLAGS.dataset == "text2shape":
+                load_mode = FLAGS.mode
+            elif FLAGS.dataset == "objaverse":
+                load_mode = FLAGS.mode * 10
+            else:
+                raise ValueError(f"Invalid Dataset: '{FLAGS.dataset}' to load weights")
+            print(f"Loading {MODEL_PATHS[load_mode]} weights...")
+            model.load_state_dict(torch.load(MODEL_PATHS[load_mode]))
 
     print("Model: ", model)
+    print("\n")
     print("--- %s seconds to load MMShapE---" % (time.time() - start_time))
 
-    if FLAGS.train:
-        #optimizer = optim.Adam(model.parameters(), lr=FLAGS.learning_rate)
-        #optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=FLAGS.learning_rate)
 
-        optimizer = optim.Adam(model.cross_modal_attention.parameters(), lr=FLAGS.learning_rate)
-        #loss_fn = PerceptualLoss()
-        loss_fn = torch.nn.MSELoss()
-        train_model(model, train_loader, FLAGS.mode, loss_fn, optimizer, num_epochs=FLAGS.epochs, device=device, save_graphic_epoch=0)
+
+
+
+    # ================= Training ================= 
+
+    if FLAGS.train:
+        optimizer = optim.Adam(model.parameters(), lr=FLAGS.learning_rate)
+        if FLAGS.dataset == "text2shape":
+            #optimizer = optim.Adam(model.cross_modal_attention.parameters(), lr=FLAGS.learning_rate)
+            #loss_fn = PerceptualLoss()
+            loss_fn = torch.nn.MSELoss()
+            train_model_text2shape(model, train_loader, FLAGS.mode, loss_fn, optimizer, num_epochs=FLAGS.epochs, device=device, save_graphic_epoch=0)
+        elif FLAGS.dataset == "objaverse":
+            loss_fn = torch.nn.MSELoss()
+            train_model_objaverse(model, train_loader, FLAGS.mode, loss_fn, optimizer, num_epochs=FLAGS.epochs, device=device)
+        else:
+            raise ValueError(f"Invalid Dataset: '{FLAGS.dataset}' for training")
 
         #dummy_dataset = DummyDataset(num_samples=10)
         #dataloader = DataLoader(dummy_dataset, batch_size=2, shuffle=True)
         #check_weight_updates(model, dataloader)
+
+
+
+
+    # ================= Evaluation ================= 
+
+    if FLAGS.eval:
+        evaluate_text2shape(model, test_loader, device=device, fid_batch_size=30)
+
+
+
+
+
+    # ================= Demo ================= 
 
     if FLAGS.demo:
         """
@@ -1328,14 +1963,22 @@ def main(FLAGS):
                             save_obj=False)
         """
 
-        demo_text2shape(model, test_loader, device='cuda', num_samples=FLAGS.n)
-    
+        if FLAGS.dataset == "text2shape":
+            demo_text2shape(model, test_loader, device=device, num_samples=FLAGS.n)
+        elif FLAGS.dataset == "objaverse":
+            demo_objaverse(model, test_loader, device, output_dir='./output/demos/')
+        else:
+            raise ValueError(f"Invalid Dataset: '{FLAGS.dataset}' for demo")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser('Multimodal Shap-E')
+    parser.add_argument('--dataset',
+                        type=str, default='text2shape',
+                        help='Dataset to use for training, eval, or demo.')
     parser.add_argument('--mode',
                         type=int, default=1,
-                        help="Determines what fusion mode to use")
+                        help="Determines what fusion mode or model to use")
     parser.add_argument('--load',
                         action='store_true',
                         help='An option to load weights')
