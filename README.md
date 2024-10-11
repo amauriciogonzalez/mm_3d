@@ -1,6 +1,6 @@
 # MM-Shap-E: A Multimodal Text-and-Image-to-3D Pipeline
 
-*This README is still in progress and is subject to change*
+*This README is subject to change as the project progresses*
 
 
 ## Setup
@@ -33,7 +33,7 @@ pip install -r requirements.txt
 
 
 
-## Arguments (mm_shap_e.py)
+## Arguments (`mm_shap_e.py`)
 
 ### General
 
