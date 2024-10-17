@@ -36,6 +36,7 @@ import time
 from typing import Union
 from pprint import pprint
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
 import struct
 from typing import BinaryIO, Optional
 import random
@@ -47,7 +48,11 @@ WEIGHTS_DIR = "./weights/"
 
 MODEL_PATHS = {
     2: WEIGHTS_DIR+"mm_shap_e_t2s_crossmodal_attn.pth",
+    3: WEIGHTS_DIR+"mm_shap_e_t2s_crossmodal_attn_seq.pth",
+    4: WEIGHTS_DIR+"mm_shap_e_t2s_gated_fusion.pth",
     20: WEIGHTS_DIR+"mm_shap_e_ov_crossmodal_attn.pth",
+    30: WEIGHTS_DIR+"mm_shap_e_ov_crossmodal_attn_seq.pth",
+    40: WEIGHTS_DIR+"mm_shap_e_ov_gated_fusion.pth",
 }
 
 
@@ -105,6 +110,92 @@ class CrossModalAttention(nn.Module):
         attn_output_expanded = self.expand_dim(attn_output)
         
         return attn_output_expanded
+
+
+
+class CrossModalAttentionSeqLevel(nn.Module):
+    def __init__(self, latent_dim, token_dim=1024, num_heads=8):
+        super(CrossModalAttentionSeqLevel, self).__init__()
+        self.latent_dim = latent_dim
+        self.token_dim = token_dim  # Size of each token (1024)
+        self.num_heads = num_heads
+        
+        # Attention layers
+        self.query = nn.Linear(token_dim, token_dim)
+        self.key = nn.Linear(token_dim, token_dim)
+        self.value = nn.Linear(token_dim, token_dim)
+        
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=token_dim, num_heads=num_heads)
+        
+    def forward(self, image_latents, text_latents):
+        # image_latents and text_latents should have shape [batch_size, 1, latent_dim]
+        
+        # Reshape latents into sequences of tokens (batch_size, 1024, 1024)
+        batch_size = image_latents.size(0)
+        image_latents = image_latents.view(batch_size, 1024, self.token_dim)
+        text_latents = text_latents.view(batch_size, 1024, self.token_dim)
+        
+        # Permute for MultiheadAttention compatibility: [seq_len, batch_size, token_dim]
+        image_latents = image_latents.permute(1, 0, 2)  # [1024, batch_size, 1024]
+        text_latents = text_latents.permute(1, 0, 2)    # [1024, batch_size, 1024]
+
+        # Compute query, key, value for cross-attention
+        query = self.query(image_latents)
+        key = self.key(text_latents)
+        value = self.value(text_latents)
+
+        # Cross-modal attention: image queries text
+        attn_output, _ = self.multihead_attn(query, key, value)
+        
+        # Transpose back to [batch_size, 1024, token_dim]
+        attn_output = attn_output.permute(1, 0, 2)
+        
+        # Reshape back to [batch_size, 1, latent_dim] (1048576)
+        attn_output = attn_output.reshape(batch_size, 1, self.latent_dim)
+        
+        return attn_output
+
+
+class GatedFusionModule(nn.Module):
+    def __init__(self, latent_dim, reduced_dim=1024):
+        super(GatedFusionModule, self).__init__()
+        
+        # Reduce the latent dimension to a smaller size for efficient gating
+        self.reduce_dim = nn.Linear(latent_dim, reduced_dim)
+        
+        # MLP for generating fusion weights
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(reduced_dim * 2, reduced_dim),
+            nn.ReLU(),
+            nn.Linear(reduced_dim, 2),  # Outputs two values, one for image and one for text
+            nn.Softmax(dim=-1)  # Softmax ensures that weights sum to 1
+        )
+        
+        # Expand the reduced latent back to the original dimension
+        self.expand_dim = nn.Linear(reduced_dim, latent_dim)
+    
+    def forward(self, image_latents, text_latents):
+        # Reduce dimensionality of latents
+        reduced_image_latents = self.reduce_dim(image_latents)
+        reduced_text_latents = self.reduce_dim(text_latents)
+        
+        # Concatenate the reduced latents along the last dimension
+        combined_latents = torch.cat([reduced_image_latents, reduced_text_latents], dim=-1)
+        
+        # Generate the fusion weights
+        weights = self.gate_mlp(combined_latents)  # Shape: [batch_size, 2]
+
+        # Split the weights into image and text components
+        weight_image = weights[:, 0].unsqueeze(-1)  # Shape: [batch_size, 1]
+        weight_text = weights[:, 1].unsqueeze(-1)  # Shape: [batch_size, 1]
+
+        # Apply the weights to the respective latents and sum
+        fused_latents = (weight_image * reduced_image_latents) + (weight_text * reduced_text_latents)
+        
+        # Expand the fused latents back to the original dimension
+        fused_latents = self.expand_dim(fused_latents)
+        
+        return fused_latents
 
 
 # ================================================================================== Models ==================================================================================
@@ -452,8 +543,12 @@ class MMShapE(BaseShapE):
         self.image_karras_steps = image_karras_steps
         self.text_karras_steps = text_karras_steps
         
-        # Initialize cross-modal attention with reduced latent size
-        self.cross_modal_attention = CrossModalAttention(latent_dim=self.d_latent_dim, reduced_dim=self.d_reduced_dim, num_heads=num_cm_heads)
+        if fusion_mode == 2:
+            self.cross_modal_attention = CrossModalAttention(latent_dim=self.d_latent_dim, reduced_dim=self.d_reduced_dim, num_heads=num_cm_heads)
+        elif fusion_mode == 3:
+            self.cross_modal_attention_seq_level = CrossModalAttentionSeqLevel(latent_dim=self.d_latent_dim, token_dim=1024, num_heads=num_cm_heads)
+        elif fusion_mode == 4:
+            self.gated_fusion = GatedFusionModule(latent_dim=self.d_latent_dim, reduced_dim=1024)
 
 
 
@@ -569,6 +664,10 @@ class MMShapE(BaseShapE):
             fused_latents = (0.5 * image_latents) + (0.5 * text_latents)
         elif self.fusion_mode == 2:
             fused_latents =  self.cross_modal_attention(image_latents, text_latents)
+        elif self.fusion_mode == 3:
+            fused_latents = self.cross_modal_attention_seq_level(image_latents, text_latents)
+        elif self.fusion_mode == 4:
+            fused_latents = self.gated_fusion(image_latents, text_latents)
         else:
             raise ValueError(f'Invalid fusion mode: {self.fusion_mode}')
         
@@ -1232,6 +1331,8 @@ def train_model_objaverse(model, dataloader, mode, loss_fn, optimizer, num_epoch
 
     model.train()  # Set the model to training mode
 
+    start_training_time = time.time()
+
     print(f'{("="*20)}  TRAINING {("="*20)}')
     print(f'Number of training samples: {len(dataloader.dataset)}')
 
@@ -1244,6 +1345,7 @@ def train_model_objaverse(model, dataloader, mode, loss_fn, optimizer, num_epoch
     total_latent_time = 0.0
     total_loss_time = 0.0
     num_batches = len(dataloader)  # Total number of batches
+    best_loss = float('inf')
 
     for epoch in range(num_epochs):
         total_loss = 0.0
@@ -1298,12 +1400,24 @@ def train_model_objaverse(model, dataloader, mode, loss_fn, optimizer, num_epoch
         total_epoch_time = epoch_end_time - epoch_start_time
         print(f"Epoch [{epoch + 1}/{num_epochs}], Average Loss: {avg_loss:.4f}, Time: {total_epoch_time:.2f}s, Peak GPU Memory: {max_gpu_memory_MB:.2f} MB")
 
+        if avg_loss < best_loss and (epoch + 1) % 5 == 0:
+            if not os.path.exists(WEIGHTS_DIR):
+                os.makedirs(WEIGHTS_DIR)
+            torch.save(model.state_dict(), MODEL_PATHS[mode*10])
+            print(f"Checkpoint saved at {MODEL_PATHS[mode*10]}.")
+
+
+    end_training_time = time.time()
+
+    training_time_minutes = (end_training_time - start_training_time) / 60
+
     # Calculate average times for each operation
     avg_latent_time = total_latent_time / (num_epochs * num_batches)
     avg_loss_time = total_loss_time / (num_epochs * num_batches)
 
     print(f"\nAverage time to compute latents: {avg_latent_time:.4f} seconds per batch")
     print(f"Average time to compute loss: {avg_loss_time:.4f} seconds per batch")
+    print(f"Total Training time: {training_time_minutes:.2f} minutes")
 
     # Save model weights at the end of training
     if not os.path.exists(WEIGHTS_DIR):
@@ -1392,19 +1506,24 @@ def check_weight_updates(model, dataloader):
 
 # ================================================================================== Evaluation ==================================================================================
 
+# ========================================= Text2Shape Evaluation =========================================
+
 def evaluate_text2shape(model, dataloader, device='cuda', fid_batch_size=30):
     """
-    Evaluate a text-to-shape model using FID and CLIP-R precision.
+    Evaluate a text-to-shape model using FID, CLIP-R precision, and PSNR.
     
     Args:
         model: The pre-trained text-to-shape model to be evaluated.
         dataloader: DataLoader containing the dataset with real image tensors.
         device: Device to run the evaluation on ('cuda' or 'cpu').
-        batch_size: Number of images to process in a batch for FID calculation.
+        fid_batch_size: Number of images to process in a batch for FID calculation.
     
     Returns:
         fid_value: Computed FID score between real and generated images.
-        average_clip_r: Computed CLIP-R precision.
+        average_clip_r_text: Computed CLIP-R precision with respect to text prompts.
+        average_clip_r_image: Computed CLIP-R precision with respect to input images.
+        overall_clip_r: Average of text-based and image-based CLIP-R precision.
+        average_psnr: Computed average PSNR between real and generated images.
     """
     model.eval()
 
@@ -1413,7 +1532,6 @@ def evaluate_text2shape(model, dataloader, device='cuda', fid_batch_size=30):
     generated_image_batches = []
     fid_preprocess = transforms.Compose([
         transforms.Resize((299, 299)),
-        #transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
@@ -1424,10 +1542,16 @@ def evaluate_text2shape(model, dataloader, device='cuda', fid_batch_size=30):
     nvidia_smi.nvmlInit()
     handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)  # Assuming using the first GPU
 
-
     start_time = time.time()  # Start timing
 
     all_descriptions = []
+    all_input_images = []
+    psnr_values = []
+
+    # Lists to store selected viewpoints for CLIP-R precision
+    selected_view_pred_images = []
+    selected_view_real_images = []
+
     for batch_idx, (sample_voxels, sample_descriptions, sample_images) in enumerate(dataloader):
         # Move tensors to the specified device
         sample_voxels = sample_voxels.to(device)
@@ -1453,12 +1577,18 @@ def evaluate_text2shape(model, dataloader, device='cuda', fid_batch_size=30):
         real_image_batches.append(sample_images.detach().cpu())
         generated_image_batches.append(predicted_image_tensors.detach().cpu())
 
-        all_descriptions = all_descriptions + sample_descriptions
+        # Store descriptions and input images for CLIP-R precision
+        all_descriptions += sample_descriptions
+        all_input_images += sample_projection_images.detach().cpu()
 
-        # Compute CLIP-R Precision for the current batch
-        #clip_r_batch = compute_clip_r_precision(clip_model, predicted_image_tensors, sample_descriptions)
-        #print(f"Batch {batch_idx + 1} CLIP-R Precision: {clip_r_batch:.4f}")
+        # Compute PSNR for the current batch
+        for real_img, pred_img in zip(sample_images, predicted_image_tensors):
+            selected_view_real_images.append(real_img[-1].cpu())  # Select the last viewpoint
+            selected_view_pred_images.append(pred_img[-1].cpu())  # Select the last viewpoint
 
+            # Compute PSNR for the current batch (use all viewpoints)
+            psnr_value = psnr(pred_img, real_img)
+            psnr_values.append(psnr_value)
 
     max_gpu_memory = nvidia_smi.nvmlDeviceGetMemoryInfo(handle).used
     max_gpu_memory_MB = max_gpu_memory / 1e6
@@ -1484,12 +1614,177 @@ def evaluate_text2shape(model, dataloader, device='cuda', fid_batch_size=30):
     fid_value = compute_fid(real_images_fid, generated_images_fid, batch_size=fid_batch_size, cuda=(device == 'cuda'))
     print(f"FID score: {fid_value:.4f}")
 
-    # Calculate overall CLIP-R Precision
-    average_clip_r = compute_clip_r_precision(clip_model, generated_images, all_descriptions)
-    
-    print(f"Overall CLIP-R Precision: {average_clip_r:.4f}")
+    # Calculate CLIP-R precision using the selected viewpoints
+    average_clip_r_text, average_clip_r_image, overall_clip_r = compute_clip_r_precision(
+        clip_model, selected_view_pred_images, all_descriptions, selected_view_real_images
+    )
+    print(f"CLIP-R Precision (Text): {average_clip_r_text:.4f}")
+    print(f"CLIP-R Precision (Image): {average_clip_r_image:.4f}")
+    print(f"Overall CLIP-R Precision: {overall_clip_r:.4f}")
 
-    return fid_value, average_clip_r
+    # Calculate the average PSNR, excluding infinite values
+    finite_psnr_values = [p for p in psnr_values if not torch.isinf(torch.tensor(p))]
+    if finite_psnr_values:
+        average_psnr = sum(finite_psnr_values) / len(finite_psnr_values)
+        print(f"Average PSNR: {average_psnr:.4f} dB")
+    else:
+        average_psnr = None
+        print("No finite PSNR values found for averaging.")
+
+    return fid_value, average_clip_r_text, average_clip_r_image, overall_clip_r, average_psnr
+
+
+
+
+# ========================================= Objaverse Evaluation =========================================
+
+def evaluate_objaverse(model, dataloader, device='cuda', fid_batch_size=30):
+    """
+    Evaluate a model using the Objaverse dataset with metrics like FID, CLIP-R precision, and PSNR.
+
+    Args:
+        model: The trained model to be evaluated.
+        dataloader: DataLoader containing the Objaverse dataset.
+        device: Device to run the evaluation on ('cuda' or 'cpu').
+        fid_batch_size: Number of images to process in a batch for FID calculation.
+
+    Returns:
+        fid_value: Computed FID score between real and generated images.
+        average_clip_r_text: Computed CLIP-R precision with respect to text prompts.
+        average_clip_r_image: Computed CLIP-R precision with respect to input images.
+        overall_clip_r: Average of text-based and image-based CLIP-R precision.
+        average_psnr: Computed average PSNR between real and generated images.
+        average_inference_time: Average time taken for inference per sample.
+    """
+    model.eval()
+
+    # FID Prereqs
+    real_image_batches = []
+    generated_image_batches = []
+    fid_preprocess = transforms.Compose([
+        transforms.Resize((299, 299)),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    # CLIP-R Precision Prereqs
+    clip_model = SentenceTransformer("clip-ViT-B-32")
+
+    # Initialize Nvidia SMI to monitor GPU memory usage
+    nvidia_smi.nvmlInit()
+    handle = nvidia_smi.nvmlDeviceGetHandleByIndex(0)  # Assuming using the first GPU
+
+    start_time = time.time()  # Start timing
+
+    all_descriptions = []
+    all_input_images = []
+    psnr_values = []
+    inference_times = []
+
+    # Initialize lists for storing the selected viewpoint images for CLIP-R precision
+    selected_view_pred_images = []
+    selected_view_real_images = []
+
+    cameras = create_pan_cameras(64, model.device)
+    viewpoint_indices = [0, 4, 8, 12]
+
+    for batch_idx, (images1, images2, captions, latent_codes) in enumerate(dataloader):
+        # Move tensors to the specified device
+        images2 = images2.to(device)
+        latent_codes = latent_codes.to(device)
+
+        # Time the inference for this batch
+        batch_start_time = time.time()
+
+        # Generate the 3D projections
+        with torch.no_grad():
+            # Forward pass to get predicted latents
+            if isinstance(model, MMShapE):
+                latents, _, _ = model.forward(images=images2, prompts=captions, remove_background=False)
+            elif isinstance(model, ShapE):
+                if model.input_mode == -1:
+                    inputs = images2
+                elif model.input_mode == -2:
+                    inputs = captions
+                else:
+                    raise ValueError("Choose a valid ShapE input mode.")
+                latents = model.forward(inputs=inputs)
+
+            predicted_image_batches_pil = []
+            real_image_batches_pil = []
+            for i, pred_latent in enumerate(latents):
+                predicted_images = decode_latent_images(model.xm, pred_latent, cameras, rendering_mode='nerf')
+                predicted_images = [predicted_images[i] for i in viewpoint_indices]
+                real_images = decode_latent_images(model.xm, latent_codes[i], cameras, rendering_mode='nerf')
+                real_images = [real_images[i] for i in viewpoint_indices]
+
+                # Append the entire set of viewpoints for FID and PSNR calculation
+                predicted_image_batches_pil.append(predicted_images)
+                real_image_batches_pil.append(real_images)
+
+                # Extract a single viewpoint (e.g., the first viewpoint)
+                selected_view_pred_images.append(predicted_images[0])
+                selected_view_real_images.append(real_images[0])
+
+        # Record the time taken for this batch's inference
+        batch_inference_time = time.time() - batch_start_time
+        inference_times.append(batch_inference_time)
+
+        # Collect real and generated images for FID calculation
+        real_image_batches.append(torch.stack([transforms.ToTensor()(img) for batch in real_image_batches_pil for img in batch]))
+        generated_image_batches.append(torch.stack([transforms.ToTensor()(img) for batch in predicted_image_batches_pil for img in batch]))
+
+        # Store descriptions and input images for CLIP-R precision
+        all_descriptions += captions
+        all_input_images += images2.cpu()
+
+        # Compute PSNR for the current batch (compare tensor versions of the images)
+        for real_img, pred_imgs in zip(real_image_batches, generated_image_batches):
+            for pred_img in pred_imgs:
+                psnr_value = psnr(pred_img, real_img)
+                psnr_values.append(psnr_value)
+
+    max_gpu_memory = nvidia_smi.nvmlDeviceGetMemoryInfo(handle).used
+    max_gpu_memory_MB = max_gpu_memory / 1e6
+    print(f"GPU Memory: {max_gpu_memory_MB:.2f} MB")
+
+    time_taken = time.time() - start_time
+    print(f"Time taken: {time_taken/60:.4f} minutes")
+
+    # Concatenate all batches
+    real_images = torch.cat(real_image_batches)
+    generated_images = torch.cat(generated_image_batches)
+
+    # Preprocess images for FID calculation
+    real_images_fid = torch.stack([fid_preprocess(img) for img in real_images])
+    generated_images_fid = torch.stack([fid_preprocess(img) for img in generated_images])
+
+    # Compute FID between real and generated images
+    fid_value = compute_fid(real_images_fid, generated_images_fid, batch_size=fid_batch_size, cuda=(device == 'cuda'))
+    print(f"FID score: {fid_value:.4f}")
+
+    # Calculate overall CLIP-R Precision using selected viewpoints
+    average_clip_r_text, average_clip_r_image, overall_clip_r = compute_clip_r_precision(
+        clip_model, selected_view_pred_images, all_descriptions, selected_view_real_images
+    )
+    print(f"CLIP-R Precision (Text): {average_clip_r_text:.4f}")
+    print(f"CLIP-R Precision (Image): {average_clip_r_image:.4f}")
+    print(f"Overall CLIP-R Precision: {overall_clip_r:.4f}")
+
+    # Calculate the average PSNR, excluding infinite values
+    finite_psnr_values = [p for p in psnr_values if not torch.isinf(torch.tensor(p))]
+    if finite_psnr_values:
+        average_psnr = sum(finite_psnr_values) / len(finite_psnr_values)
+        print(f"Average PSNR: {average_psnr:.4f} dB")
+    else:
+        average_psnr = None
+        print("No finite PSNR values found for averaging.")
+
+    # Calculate the average inference time per sample
+    average_inference_time = sum(inference_times) / len(inference_times)
+    print(f"Average inference time per batch: {average_inference_time:.4f} seconds")
+
+    return fid_value, average_clip_r_text, average_clip_r_image, overall_clip_r, average_psnr, average_inference_time
+
 
 
 
@@ -1557,29 +1852,51 @@ def compute_fid(real_images, generated_images, batch_size, cuda=True, dims=2048)
 # ========================================= CLIP-R Precision =========================================
 
 
-def compute_clip_r_precision(model, generated_images, text_prompts):
-    """Calculate CLIP-R precision for the generated images."""
-    all_cosine_scores = []
+def compute_clip_r_precision(model, generated_images, text_prompts, input_images):
+    """Calculate CLIP-R precision for the generated images with respect to text prompts and input images."""
+    text_cosine_scores = []
+    image_cosine_scores = []
 
-    for img_tensor, text in zip(generated_images, text_prompts):
-        # Convert tensor to PIL Image
-        image_pil = transforms.ToPILImage()(img_tensor)
+    for img_tensor, text, input_image in zip(generated_images, text_prompts, input_images):
+        # Convert tensors to PIL Image
+        if torch.is_tensor(img_tensor):
+            generated_image_pil = transforms.ToPILImage()(img_tensor)
+        else:
+            generated_image_pil = img_tensor
+        if torch.is_tensor(input_image):
+            input_image_pil = transforms.ToPILImage()(input_image)
+        else:
+            input_image_pil = input_image
         
-        # Encode the image and text
-        img_emb = model.encode([image_pil])
+        # Encode the generated image, input image, and text
+        generated_image_emb = model.encode([generated_image_pil])
+        input_image_emb = model.encode([input_image_pil])
         text_emb = model.encode([text])
         
-        # Compute cosine similarity
-        cos_score = util.cos_sim(img_emb, text_emb)
-        all_cosine_scores.append(cos_score[0][0].cpu().numpy())
-    
-    # Calculate the average cosine similarity (CLIP-R Precision)
-    average_clip_r = np.mean(all_cosine_scores)
-
-    return average_clip_r
+        # Compute cosine similarities
+        text_cos_score = util.cos_sim(generated_image_emb, text_emb)
+        image_cos_score = util.cos_sim(generated_image_emb, input_image_emb)
         
+        # Store the cosine similarities
+        text_cosine_scores.append(text_cos_score[0][0].cpu().numpy())
+        image_cosine_scores.append(image_cos_score[0][0].cpu().numpy())
+    
+    # Calculate the average cosine similarities
+    average_clip_r_text = np.mean(text_cosine_scores)
+    average_clip_r_image = np.mean(image_cosine_scores)
+    overall_clip_r = (average_clip_r_text + average_clip_r_image) / 2
+
+    return average_clip_r_text, average_clip_r_image, overall_clip_r
 
 
+#========================================= PSNR =========================================
+
+def psnr(pred, gt):
+    mse = torch.mean((pred - gt) ** 2)
+    if mse == 0:
+        return float('inf')
+    return 10 * torch.log10(1 / mse)
+        
 
 
 # ================================================================================== Demo and Display ==================================================================================
@@ -1744,11 +2061,11 @@ def demo_objaverse(model, dataloader, device, output_dir='./output/demos/'):
             )
 
             for j, fused_latent in enumerate(fused_latents):
-                gt_gif_path = model.gif_path + '/' + f'sample_{i}_gt.gif'
-                pred_gif_path = model.gif_path + '/' + f'sample_{i}_pred.gif'
+                gt_gif_path = model.gif_path + '/' + f'sample_{j}_gt.gif'
+                pred_gif_path = model.gif_path + '/' + f'sample_{j}_pred.gif'
 
-                gt_images = decode_latent_images(model.xm, fused_latent, cameras, rendering_mode='nerf')
-                pred_images = decode_latent_images(model.xm, latent_codes[j], cameras, rendering_mode='nerf')
+                gt_images = decode_latent_images(model.xm, latent_codes[j], cameras, rendering_mode='nerf')
+                pred_images = decode_latent_images(model.xm, fused_latent, cameras, rendering_mode='nerf')
 
                 imageio.mimsave(gt_gif_path, gt_images, fps=10)  
                 imageio.mimsave(pred_gif_path, pred_images, fps=10)  
@@ -1780,12 +2097,14 @@ def demo_objaverse(model, dataloader, device, output_dir='./output/demos/'):
                 ani = FuncAnimation(fig, update, frames=len(gt_images), interval=200, blit=True)
 
                 # Save the animated plot as a GIF
-                gif_path = os.path.join(output_dir, f'sample_{i}_comparison.gif')
+                gif_path = os.path.join(output_dir, f'sample_{j}_comparison.gif')
                 ani.save(gif_path, writer=PillowWriter(fps=10))
-                print(f"Saved animated comparison plot for sample {i} at {gif_path}")
+                print(f"Saved animated comparison plot for sample {j} at {gif_path}")
 
                 # Close the plot to free memory
                 plt.close()
+
+            break
 
 
 # ========================================= General Demos =========================================
@@ -1832,15 +2151,15 @@ def main(FLAGS):
     if FLAGS.dataset == 'text2shape':
         print("Initializing Text2Shape...")
 
-        dataset_dir = "./text2shape/nrrd_256_filter_div_32/nrrd_256_filter_div_32"
-        csv_dir = "./text2shape/captions.tablechair.csv"
+        dataset_dir = FLAGS.t2s_nrrd_dir
+        csv_dir = FLAGS.t2s_csv_path
         dataset = Text2ShapeDataset(dataset_dir=dataset_dir, csv_path=csv_dir)
     elif FLAGS.dataset == 'objaverse':
         print("Initializing Objaverse...")
 
-        image_dir = "/lustre/fs1/home/cap6411.student4/Project/mvs_objaverse/Objaverse_Dataset/rendered_images/"
-        caption_csv = "/lustre/fs1/home/cap6411.student4/Project/mvs_objaverse/objaverse_csv.csv"
-        latent_code_dir = "/lustre/fs1/home/cap6411.student3/final_project/Cap3D/Cap3D_latentcodes/"
+        image_dir = FLAGS.obja_img_dir
+        caption_csv = FLAGS.obja_csv_path
+        latent_code_dir = FLAGS.obja_latent_dir
         transform = transforms.ToTensor()
 
         dataset = ObjaverseDataset(
@@ -1852,7 +2171,7 @@ def main(FLAGS):
     else:
         raise ValueError(f"Invalid Dataset: {FLAGS.dataset}")
 
-    train_loader, test_loader = create_train_test_split(dataset, test_size=0.2, batch_size=FLAGS.batch_size, num_samples=FLAGS.n)
+    train_loader, test_loader = create_train_test_split(dataset, test_size=0.01, batch_size=FLAGS.batch_size, num_samples=FLAGS.n)
 
 
 
@@ -1880,7 +2199,9 @@ def main(FLAGS):
 
         # Fusion modes:
         #  1 -> Average fusion (not trainable),
-        #  2 -> cross-modal fusion
+        #  2 -> Cross-modal fusion,
+        #  3 -> Cross-modal fusion at sequence level,
+        #  4 -> Gated fusion
 
         model = MMShapE(
                         fusion_mode=FLAGS.mode,
@@ -1939,7 +2260,12 @@ def main(FLAGS):
     # ================= Evaluation ================= 
 
     if FLAGS.eval:
-        evaluate_text2shape(model, test_loader, device=device, fid_batch_size=30)
+        if FLAGS.dataset == "text2shape":
+            evaluate_text2shape(model, test_loader, device=device, fid_batch_size=30)
+        elif FLAGS.dataset == "objaverse":
+            evaluate_objaverse(model, test_loader, device=device, fid_batch_size=30)
+        else:
+            raise ValueError(f"Invalid Dataset: '{FLAGS.dataset}' for evaluation")
 
 
 
@@ -1973,33 +2299,74 @@ def main(FLAGS):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser('Multimodal Shap-E')
+
+    # ======= Dataset Args =======
     parser.add_argument('--dataset',
                         type=str, default='text2shape',
-                        help='Dataset to use for training, eval, or demo.')
+                        help='''
+                        Dataset to use for training, eval, or demo.
+                        Compatible datasets:
+                        * text2shape
+                        * objaverse
+                        ''')
+    parser.add_argument('--t2s_nrrd_dir',
+                        type=str, default="/lustre/fs1/home/cap6411.student3/final_project/text2shape/nrrd_256_filter_div_32/nrrd_256_filter_div_32",
+                        help='Text2Shape directory storing all nrrd voxelization files.')
+    parser.add_argument('--t2s_csv_path',
+                        type=str, default="/lustre/fs1/home/cap6411.student3/final_project/text2shape/captions.tablechair.csv",
+                        help='Text2Shape csv file path mapping object ids to captions.')
+    parser.add_argument('--obja_img_dir',
+                        type=str, default="/lustre/fs1/home/cap6411.student4/Project/mvs_objaverse/Objaverse_Dataset/rendered_images/",
+                        help='Objaverse directory storing rendered images in the form "<object_id>_view_1.png" and "<object_id>_view_2.png".')
+    parser.add_argument('--obja_csv_path',
+                        type=str, default="/lustre/fs1/home/cap6411.student4/Project/mvs_objaverse/objaverse_csv.csv",
+                        help='Objaverse csv file path mapping object ids to captions.')
+    parser.add_argument('--obja_latent_dir',
+                        type=str, default="/lustre/fs1/home/cap6411.student3/final_project/Cap3D/Cap3D_latentcodes/",
+                        help='Objaverse directory storing Shap-E latent codes for objects having names "<object_id>.pt".')
+    parser.add_argument('--n',
+                        type=int, default=0,
+                        help='Number of samples to use when training and/or evaluating. Leave at 0 for all samples.')
+
+    # ======= Model Args =======
     parser.add_argument('--mode',
                         type=int, default=1,
-                        help="Determines what fusion mode or model to use")
+                        help="""
+                        Determines what fusion mode or model to use.
+                        Current fusion/model modes:
+                        * -1 -> img-to-3D Shap-E
+                        * -2 -> txt-to-3D Shap-E
+                        * 1 -> Average fusion MM-Shap-E
+                        * 2 -> Cross-modal fusion MM-Shap-E
+                        * 3 -> Cross-modal fusion at sequence level MM-Shap-E
+                        * 4 -> Gated fusion MM-Shap-E
+                        """)
     parser.add_argument('--load',
                         action='store_true',
-                        help='An option to load weights')
+                        help='An option to load weights before training, eval, or demo')
+
+
+    # ======= Training Args =======
     parser.add_argument('--epochs',
                         type=int, default=3,
                         help='Number of epochs to train for.')
     parser.add_argument('--batch_size',
                         type=int, default=8,
                         help='batch size.')
-    parser.add_argument('--n',
-                        type=int, default=0,
-                        help='Number of samples to use when training and/or evaluating. Leave at 0 for all samples.')
     parser.add_argument('--learning_rate',
                         type=float, default=0.001,
                         help='Learning rate for training.')
     parser.add_argument('--train',
                         action='store_true',
                         help='Run training loop.')
+
+
+    # ======= Eval Args =======
     parser.add_argument('--eval',
                         action='store_true',
                         help='Run evaluation loop.')
+
+    # ======= Demo Args =======
     parser.add_argument('--demo',
                         action='store_true',
                         help='Run demo')
