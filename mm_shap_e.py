@@ -13,7 +13,7 @@ from shap_e.models.nn.camera import DifferentiableCameraBatch, DifferentiablePro
 from shap_e.models.transmitter.base import Transmitter, VectorDecoder
 import imageio
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance
 from pathlib import Path
 import torch
 import torch.optim as optim
@@ -35,6 +35,7 @@ import nvidia_smi
 import time
 from typing import Union
 from pprint import pprint
+import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 import struct
@@ -43,6 +44,9 @@ import random
 from sentence_transformers import SentenceTransformer, util
 from concurrent.futures import ThreadPoolExecutor
 import csv
+import textwrap
+
+matplotlib.use('Agg')
 
 WEIGHTS_DIR = "./weights/"
 
@@ -50,10 +54,28 @@ MODEL_PATHS = {
     2: WEIGHTS_DIR+"mm_shap_e_t2s_crossmodal_attn.pth",
     3: WEIGHTS_DIR+"mm_shap_e_t2s_crossmodal_attn_seq.pth",
     4: WEIGHTS_DIR+"mm_shap_e_t2s_gated_fusion.pth",
+    5: WEIGHTS_DIR+"mm_shap_e_t2s_weighted_fusion.pth",
+    6: WEIGHTS_DIR+"mm_shap_e_t2s_minor_attn.pth",
     20: WEIGHTS_DIR+"mm_shap_e_ov_crossmodal_attn.pth",
     30: WEIGHTS_DIR+"mm_shap_e_ov_crossmodal_attn_seq.pth",
     40: WEIGHTS_DIR+"mm_shap_e_ov_gated_fusion.pth",
+    50: WEIGHTS_DIR+"mm_shap_e_ov_weighted_fusion.pth",
+    60: WEIGHTS_DIR+"mm_shap_e_ov_minor_attn.pth",
 }
+
+
+# ================================================================================== General Utility Functions ==================================================================================
+
+def get_model_path(mode, dataset):
+    if dataset == "text2shape":
+        load_mode = mode
+    elif dataset == "objaverse":
+        load_mode = mode * 10
+    else:
+        raise ValueError(f"Invalid Dataset: '{dataset}' to load weights")
+        
+    return MODEL_PATHS[load_mode]
+
 
 
 # ================================================================================== Model Layers for Multimodal Fusion ==================================================================================
@@ -197,6 +219,49 @@ class GatedFusionModule(nn.Module):
         
         return fused_latents
 
+
+class WeightedFusion(nn.Module):
+    def __init__(self):
+        super(WeightedFusion, self).__init__()
+        # Start with weights initialized to 0.5, so it's like averaging initially.
+        self.image_weight = nn.Parameter(torch.tensor(0.5))
+        self.text_weight = nn.Parameter(torch.tensor(0.5))
+    
+    def forward(self, image_latents, text_latents):
+        # Ensure weights sum to 1 for proper blending
+        weights_sum = torch.sigmoid(self.image_weight) + torch.sigmoid(self.text_weight)
+        image_weight_normalized = torch.sigmoid(self.image_weight) / weights_sum
+        text_weight_normalized = torch.sigmoid(self.text_weight) / weights_sum
+
+        # Weighted sum of latents
+        fused_latents = (image_weight_normalized * image_latents) + (text_weight_normalized * text_latents)
+        return fused_latents
+
+
+class MinorAttentionFusionModule(nn.Module):
+    def __init__(self, num_heads):
+        super(MinorAttentionFusionModule, self).__init__()
+        self.cross_attention = nn.MultiheadAttention(1024, num_heads)
+
+    def forward(self, image_latents, text_latents):
+        # Assuming image_latents and text_latents are of shape (batch_size, latent_dim)
+        # Reshape latents to (batch_size, 1024, 1024) if needed
+        batch_size, latent_dim = image_latents.shape
+        
+        # Reshape to (1024, batch_size, 1024) to match MultiheadAttention requirements
+        image_latents = image_latents.view(batch_size, 1024, 1024).permute(1, 0, 2)
+        text_latents = text_latents.view(batch_size, 1024, 1024).permute(1, 0, 2)
+        
+        # Apply cross-attention across rows (sequence length = 1024)
+        attn_output, _ = self.cross_attention(image_latents, text_latents, text_latents)
+        
+        # Reshape back to original shape (batch_size, latent_dim)
+        attn_output = attn_output.permute(1, 0, 2).contiguous().view(batch_size, latent_dim)
+        
+        # Apply the learned attention and fuse the latents
+        fused_latents = 0.9 * image_latents.permute(1, 0, 2).contiguous().view(batch_size, latent_dim) + 0.1 * attn_output
+
+        return fused_latents
 
 # ================================================================================== Models ==================================================================================
 
@@ -516,6 +581,7 @@ class MMShapE(BaseShapE):
                  reduced_dim=512,
                  num_cm_heads=8,
                  use_transmitter=True,
+                 parallelize=False,
                  output_path='./output'
                  ):
         super(MMShapE, self).__init__()
@@ -542,6 +608,8 @@ class MMShapE(BaseShapE):
         self.use_karras = use_karras
         self.image_karras_steps = image_karras_steps
         self.text_karras_steps = text_karras_steps
+
+        self.parallelize = parallelize
         
         if fusion_mode == 2:
             self.cross_modal_attention = CrossModalAttention(latent_dim=self.d_latent_dim, reduced_dim=self.d_reduced_dim, num_heads=num_cm_heads)
@@ -549,6 +617,10 @@ class MMShapE(BaseShapE):
             self.cross_modal_attention_seq_level = CrossModalAttentionSeqLevel(latent_dim=self.d_latent_dim, token_dim=1024, num_heads=num_cm_heads)
         elif fusion_mode == 4:
             self.gated_fusion = GatedFusionModule(latent_dim=self.d_latent_dim, reduced_dim=1024)
+        elif fusion_mode == 5:
+            self.weighted_fusion = WeightedFusion()
+        elif fusion_mode == 6:
+            self.minor_attention = MinorAttentionFusionModule(num_heads=num_cm_heads)
 
 
 
@@ -657,8 +729,11 @@ class MMShapE(BaseShapE):
         if remove_background:
             images = [self._remove_background(image) for image in images]
 
- 
-        image_latents, text_latents = self.generate_latents(images, prompts)
+
+        if self.parallelize:
+            image_latents, text_latents = self.generate_latents_parallelized(images, prompts)
+        else:
+            image_latents, text_latents = self.generate_latents(images, prompts)
 
         if self.fusion_mode == 1:
             fused_latents = (0.5 * image_latents) + (0.5 * text_latents)
@@ -668,6 +743,10 @@ class MMShapE(BaseShapE):
             fused_latents = self.cross_modal_attention_seq_level(image_latents, text_latents)
         elif self.fusion_mode == 4:
             fused_latents = self.gated_fusion(image_latents, text_latents)
+        elif self.fusion_mode == 5:
+            fused_latents = self.weighted_fusion(image_latents, text_latents)
+        elif self.fusion_mode == 6:
+            fused_latents = self.minor_attention(image_latents, text_latents)
         else:
             raise ValueError(f'Invalid fusion mode: {self.fusion_mode}')
         
@@ -761,24 +840,27 @@ class ObjaverseDataset(Dataset):
         """
         Args:
             image_dir (str): Directory with rendered images.
-            caption_csv (str): Path to the CSV file containing Object_ID and Caption.
+            caption_csv (str): Path to the CSV file containing Object_ID, Caption, and Object_Name.
             latent_code_dir (str): Directory with latent vector codes.
             transform (callable, optional): Optional transform to be applied on images.
         """
         self.image_dir = image_dir
-        self.caption_data = self._load_captions(caption_csv)
+        self.caption_data, self.object_names = self._load_captions(caption_csv)
         self.latent_code_dir = latent_code_dir
         self.transform = transform
         self.valid_object_ids = self.calculate_valid_object_ids()
 
     def _load_captions(self, caption_csv):
-        """Load captions from a CSV file and return a dictionary mapping object IDs to captions."""
+        """Load captions and object names from a CSV file and return dictionaries mapping object IDs to captions and object names."""
         captions = {}
+        object_names = {}
         with open(caption_csv, 'r') as f:
             reader = csv.DictReader(f)
             for row in reader:
-                captions[row['Object_ID']] = row['Caption']
-        return captions
+                object_id = row['Object_ID']
+                captions[object_id] = row['Caption']
+                object_names[object_id] = row['Object_Name']  # Extract the object name as well
+        return captions, object_names
 
     def calculate_valid_object_ids(self):
         """Calculate valid object IDs that have images, captions, and latent codes."""
@@ -814,17 +896,30 @@ class ObjaverseDataset(Dataset):
 
         # Apply any specified transformations to the images
         if self.transform:
+            # Apply selective brightness and saturation adjustment
+            brightness_factor = 2
+            saturation_factor = 2
+            threshold = 0.05
+            image1 = adjust_image(image1, brightness_factor, saturation_factor, threshold)
+            image2 = adjust_image(image2, brightness_factor, saturation_factor, threshold)
+
             image1 = self.transform(image1)
             image2 = self.transform(image2)
 
-        # Load caption
+        # Load caption and object name
         caption = self.caption_data[object_id]
+        object_name = self.object_names[object_id]
+
+        # Convert object_name to a more readable form
+        object_name = object_name.replace("_", " ").capitalize()
 
         # Load latent code
         latent_code_path = os.path.join(self.latent_code_dir, f"{object_id}.pt")
         latent_code = torch.load(latent_code_path)
 
-        return image1, image2, caption, latent_code
+        return image1, image2, caption, object_name, latent_code
+
+
 
 
 # ================================================================================== Dataset Utility Functions ==================================================================================
@@ -866,6 +961,34 @@ def create_train_test_split(dataset, test_size=0.2, batch_size=8, num_samples=0)
     return train_loader, test_loader
 
 
+def adjust_image(image, brightness_factor=1.5, saturation_factor=1.5, threshold=0.05):
+    # Convert the image to grayscale to create a mask
+    gray_image = transforms.functional.rgb_to_grayscale(image)  # Convert to grayscale (returns a PIL image)
+    gray_tensor = transforms.functional.to_tensor(gray_image)   # Convert PIL grayscale image to tensor
+    
+    # Create a mask based on the threshold
+    mask = gray_tensor > threshold  # Create a mask for areas where the object is present
+    
+    # Enhance brightness and saturation on the original image
+    enhancer_brightness = ImageEnhance.Brightness(image)
+    enhancer_saturation = ImageEnhance.Color(image)
+    bright_image = enhancer_brightness.enhance(brightness_factor)
+    saturated_image = enhancer_saturation.enhance(saturation_factor)
+    
+    # Convert enhanced images to tensors
+    bright_tensor = transforms.functional.to_tensor(bright_image)
+    saturated_tensor = transforms.functional.to_tensor(saturated_image)
+    original_tensor = transforms.functional.to_tensor(image)
+    
+    # Apply the mask to keep the background unchanged
+    adjusted_tensor = original_tensor.clone()  # Clone to keep the original image intact
+    adjusted_tensor[mask.expand_as(original_tensor)] = bright_tensor[mask.expand_as(original_tensor)]
+    adjusted_tensor[mask.expand_as(original_tensor)] = saturated_tensor[mask.expand_as(original_tensor)]
+    
+    # Convert the adjusted tensor back to a PIL image
+    adjusted_image = transforms.functional.to_pil_image(adjusted_tensor)
+    
+    return adjusted_image
 
 
 def convert_projection_tensors_into_lists(projection_images):
@@ -1353,7 +1476,7 @@ def train_model_objaverse(model, dataloader, mode, loss_fn, optimizer, num_epoch
 
         epoch_start_time = time.time()
 
-        for batch_idx, (images1, images2, captions, latent_codes) in enumerate(dataloader):
+        for batch_idx, (images1, images2, captions, object_names, latent_codes) in enumerate(dataloader):
             optimizer.zero_grad()
 
             # images1 is not used for now.
@@ -1638,7 +1761,42 @@ def evaluate_text2shape(model, dataloader, device='cuda', fid_batch_size=30):
 
 # ========================================= Objaverse Evaluation =========================================
 
-def evaluate_objaverse(model, dataloader, device='cuda', fid_batch_size=30):
+def evaluate_objaverse(model, dataloader, device='cuda', fid_batch_size=30, text_ablation=False, karras_ablation=False, test_parallelization=False):
+    if text_ablation or karras_ablation or test_parallelization:
+        if text_ablation:
+            text_input_eval_variations = [
+                "Results from using captions as text input",
+                "Results from using object names as text input",
+                "Results from using '\{object_name\} on its side' as text input",
+                "Results from using 'An upright \{object_name\}' as text input"
+            ]
+
+            for i, text_input_eval_variation in enumerate(text_input_eval_variations):
+                print(f"\n{('='*10)} {text_input_eval_variation} {('='*10)}")
+                evaluate_objaverse_instance(model, dataloader, device, fid_batch_size, text_ablation_step=i)
+            
+        if karras_ablation:
+            karras_configs = [(64, 64), (32, 32), (16, 16), (8, 8)]
+            for image_karras_steps, text_karras_steps in karras_configs:
+                model.image_karras_steps = image_karras_steps
+                model.text_karras_steps = text_karras_steps
+                print(f"\n{('='*10)} Results from using {(image_karras_steps, text_karras_steps)} image and text karras steps configurations {('='*10)}")
+                evaluate_objaverse_instance(model, dataloader, device, fid_batch_size)
+        if test_parallelization:
+            model.parallelize = True
+            print(f"\n{('='*10)} Results from parallelizing both latent diffusion modalities {('='*10)}")
+            evaluate_objaverse_instance(model, dataloader, device, fid_batch_size)
+
+            model.parallelize = False
+            print(f"\n{('='*10)} Results from sequentializing both latent diffusion modalities {('='*10)}")
+            evaluate_objaverse_instance(model, dataloader, device, fid_batch_size)
+    else:
+        evaluate_objaverse_instance(model, dataloader, device, fid_batch_size)
+
+
+
+
+def evaluate_objaverse_instance(model, dataloader, device='cuda', fid_batch_size=30, text_ablation_step=0):
     """
     Evaluate a model using the Objaverse dataset with metrics like FID, CLIP-R precision, and PSNR.
 
@@ -1656,6 +1814,8 @@ def evaluate_objaverse(model, dataloader, device='cuda', fid_batch_size=30):
         average_psnr: Computed average PSNR between real and generated images.
         average_inference_time: Average time taken for inference per sample.
     """
+    torch.cuda.empty_cache()
+
     model.eval()
 
     # FID Prereqs
@@ -1687,7 +1847,7 @@ def evaluate_objaverse(model, dataloader, device='cuda', fid_batch_size=30):
     cameras = create_pan_cameras(64, model.device)
     viewpoint_indices = [0, 4, 8, 12]
 
-    for batch_idx, (images1, images2, captions, latent_codes) in enumerate(dataloader):
+    for batch_idx, (images1, images2, captions, object_names, latent_codes) in enumerate(dataloader):
         # Move tensors to the specified device
         images2 = images2.to(device)
         latent_codes = latent_codes.to(device)
@@ -1699,7 +1859,16 @@ def evaluate_objaverse(model, dataloader, device='cuda', fid_batch_size=30):
         with torch.no_grad():
             # Forward pass to get predicted latents
             if isinstance(model, MMShapE):
-                latents, _, _ = model.forward(images=images2, prompts=captions, remove_background=False)
+                if text_ablation_step == 0:
+                    text_inputs = captions
+                elif text_ablation_step == 1:
+                    text_inputs = object_names
+                elif text_ablation_step == 2:
+                    text_inputs = [f"{object_name} on its side" for object_name in object_names]
+                else:
+                    text_inputs = [f"An upright {object_name}" for object_name in object_names]
+
+                latents, _, _ = model.forward(images=images2, prompts=text_inputs, remove_background=False)
             elif isinstance(model, ShapE):
                 if model.input_mode == -1:
                     inputs = images2
@@ -2026,16 +2195,16 @@ def save_samples_plots(predicted_images, target_images, descriptions, epoch):
 
 # ========================================= Objaverse Demo =========================================
 
-def demo_objaverse(model, dataloader, device, output_dir='./output/demos/'):
+def demo_objaverse(model, dataloader, device, output_dir='./output/demos/', text_ablation=False, karras_ablation=False):
     """
     Demonstrates the model's predictions on a given number of samples from the test set.
-
+    
     Args:
         model: The trained model to be evaluated.
         dataloader: DataLoader for the test set.
         device: Device to run the inference on ('cuda' or 'cpu').
-        n: Number of samples to plot/demo before exiting the function.
         output_dir: Directory to save the generated GIFs.
+        karras_ablation: If True, performs the karras steps ablation demo instead of the default.
     """
     # Create output directory if it does not exist
     if not os.path.exists(output_dir):
@@ -2046,65 +2215,221 @@ def demo_objaverse(model, dataloader, device, output_dir='./output/demos/'):
     cameras = create_pan_cameras(64, model.device)
     
     with torch.no_grad():
-        for i, (images1, images2, captions, latent_codes) in enumerate(dataloader):
-
+        for i, (images1, images2, captions, object_names, latent_codes) in enumerate(dataloader):
             # Move tensors to the specified device
             images2 = images2.to(device)
             latent_codes = latent_codes.to(device)
 
+            if text_ablation or karras_ablation:
+                if text_ablation:
+                    # Text ablation demo procedure
+                    for sample_idx in range(len(images2)):
+                        fig, axs = plt.subplots(4, 2, figsize=(10, 20))
+                        
+                        # First row: Input Image and Ground Truth
+                        axs[0, 0].imshow(images2[sample_idx].cpu().permute(1, 2, 0))
+                        axs[0, 0].set_title("Input Image")
+                        axs[0, 0].axis('off')
 
-            # Get the predicted fused latents from the model
-            fused_latents, _, _ = model.forward(
-                images=images2,
-                prompts=captions,
-                remove_background=False
-            )
+                        gt_images = decode_latent_images(model.xm, latent_codes[sample_idx], cameras, rendering_mode='nerf')
+                        gt_im = axs[0, 1].imshow(gt_images[0])
+                        axs[0, 1].set_title("Ground Truth")
+                        axs[0, 1].axis('off')
 
-            for j, fused_latent in enumerate(fused_latents):
-                gt_gif_path = model.gif_path + '/' + f'sample_{j}_gt.gif'
-                pred_gif_path = model.gif_path + '/' + f'sample_{j}_pred.gif'
+                        # Store all frames for animation
+                        fused_images_list = []
 
-                gt_images = decode_latent_images(model.xm, latent_codes[j], cameras, rendering_mode='nerf')
-                pred_images = decode_latent_images(model.xm, fused_latent, cameras, rendering_mode='nerf')
+                        # Caption-based generation
+                        inputs = [
+                            (captions[sample_idx], "Caption"),
+                            (object_names[sample_idx], "Object Name"),
+                            (f"An upright {object_names[sample_idx]}", "Augmented Prompt")
+                        ]
+                        
+                        # Iterate through each input type and generate predictions
+                        for row_idx, (text_input, input_type) in enumerate(inputs, start=1):
+                            # Generate fused latents using the given text input
+                            fused_latents, _, _ = model.forward(
+                                images=images2[sample_idx:sample_idx + 1],
+                                prompts=[text_input],
+                                remove_background=False
+                            )
+                            fused_images = decode_latent_images(model.xm, fused_latents[0], cameras, rendering_mode='nerf')
+                            fused_images_list.append(fused_images)
 
-                imageio.mimsave(gt_gif_path, gt_images, fps=10)  
-                imageio.mimsave(pred_gif_path, pred_images, fps=10)  
-                
-                 # Plotting
-                fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-                fig.suptitle(captions[j], fontsize=10)  # Use the first caption as the title for simplicity
+                            # Display the text input and associated predictions
+                            text_input = "\n".join(textwrap.wrap(text_input, width=50))
+                            axs[row_idx, 0].text(0.5, 0.5, text_input, ha='center', va='center', fontsize=12)
+                            axs[row_idx, 0].set_title(f"{input_type} Input")
+                            axs[row_idx, 0].axis('off')
 
-                # Input image
-                axs[0].imshow(images2[j].cpu().permute(1, 2, 0))  # Assuming images2 is a batch of tensors with shape (N, C, H, W)
-                axs[0].set_title("Input Image")
-                axs[0].axis('off')
+                            fused_im = axs[row_idx, 1].imshow(fused_images[0])
+                            axs[row_idx, 1].set_title(f"Prediction with {input_type}")
+                            axs[row_idx, 1].axis('off')
 
-                # Prepare placeholders for the animated images
-                gt_im = axs[1].imshow(gt_images[0])
-                pred_im = axs[2].imshow(pred_images[0])
-                axs[1].set_title("Ground Truth")
-                axs[1].axis('off')
-                axs[2].set_title("Predicted")
-                axs[2].axis('off')
+                        # Animation function for all rows, including the ground truth
+                        def update_ablation(frame):
+                            gt_im.set_array(gt_images[frame])
+                            for row_idx, fused_images in enumerate(fused_images_list, start=1):
+                                axs[row_idx, 1].images[0].set_array(fused_images[frame])
+                            return [gt_im] + [im for row in axs[1:] for ax in row for im in ax.images]
 
-                # Animation function
-                def update(frame):
-                    gt_im.set_array(gt_images[frame])
-                    pred_im.set_array(pred_images[frame])
-                    return [gt_im, pred_im]
+                        # Create animation for all rows
+                        ani = FuncAnimation(fig, update_ablation, frames=len(fused_images_list[0]), interval=200, blit=False)
+                        mode = model.fusion_mode
+                        model_path = MODEL_PATHS[mode * 10]
+                        model_name = model_path.split('/')[-1].split('.')[0]
+                        gif_path = os.path.join(output_dir, f'sample_{sample_idx}_text_ablation-{model_name}.gif')
+                        ani.save(gif_path, writer=PillowWriter(fps=10))
+                        print(f"Saved text ablation plot for sample {sample_idx} at {gif_path}")
 
-                # Create the animation
-                ani = FuncAnimation(fig, update, frames=len(gt_images), interval=200, blit=True)
+                        # Close the plot to free memory
+                        plt.close()
 
-                # Save the animated plot as a GIF
-                gif_path = os.path.join(output_dir, f'sample_{j}_comparison.gif')
-                ani.save(gif_path, writer=PillowWriter(fps=10))
-                print(f"Saved animated comparison plot for sample {j} at {gif_path}")
+                if karras_ablation:
+                    # Karras ablation demo procedure
+                    karras_configs = [(64, 64), (32, 32), (16, 16), (8, 8)]
+                    for sample_idx in range(len(images2)):
+                        fig, axs = plt.subplots(len(karras_configs) + 1, 3, figsize=(15, 5 * (len(karras_configs) + 1)))
+                        
+                        # Wrap caption text
+                        wrapped_caption = "\n".join(textwrap.wrap(captions[sample_idx], width=50))
 
-                # Close the plot to free memory
-                plt.close()
+                        # First row: Caption, input image, ground truth
+                        axs[0, 0].text(0.5, 0.5, wrapped_caption, ha='center', va='center', fontsize=12)
+                        axs[0, 0].set_title("Caption")
+                        axs[0, 0].axis('off')
 
-            break
+                        axs[0, 1].imshow(images2[sample_idx].cpu().permute(1, 2, 0))
+                        axs[0, 1].set_title("Input Image")
+                        axs[0, 1].axis('off')
+
+                        gt_images = decode_latent_images(model.xm, latent_codes[sample_idx], cameras, rendering_mode='nerf')
+                        gt_im = axs[0, 2].imshow(gt_images[0])
+                        axs[0, 2].set_title("Ground Truth")
+                        axs[0, 2].axis('off')
+
+                        # Store all frames for animation
+                        fused_images_list = []
+                        image_latent_images_list = []
+                        text_latent_images_list = []
+
+                        # Iterate over karras configurations and display results
+                        for row_idx, (image_steps, text_steps) in enumerate(karras_configs, start=1):
+                            model.image_karras_steps = image_steps
+                            model.text_karras_steps = text_steps
+                            
+                            # Measure inference time
+                            start_time = time.time()
+                            fused_latents, image_latents, text_latents = model.forward(
+                                images=images2[sample_idx:sample_idx + 1],
+                                prompts=[captions[sample_idx]],
+                                remove_background=False
+                            )
+                            duration = time.time() - start_time
+
+                            fused_images = decode_latent_images(model.xm, fused_latents[0], cameras, rendering_mode='nerf')
+                            image_latent_images = decode_latent_images(model.xm, image_latents[0], cameras, rendering_mode='nerf')
+                            text_latent_images = decode_latent_images(model.xm, text_latents[0], cameras, rendering_mode='nerf')
+
+                            # Append images for animation
+                            fused_images_list.append(fused_images)
+                            image_latent_images_list.append(image_latent_images)
+                            text_latent_images_list.append(text_latent_images)
+
+                            # Initialize the display for each row's images
+                            fused_im = axs[row_idx, 0].imshow(fused_images[0])
+                            axs[row_idx, 0].set_title(f"Fused Prediction\n{image_steps}/{text_steps} steps\n{duration:.2f}s")
+                            axs[row_idx, 0].axis('off')
+
+                            image_latent_im = axs[row_idx, 1].imshow(image_latent_images[0])
+                            axs[row_idx, 1].set_title(f"Image Latent\n{image_steps} steps")
+                            axs[row_idx, 1].axis('off')
+
+                            text_latent_im = axs[row_idx, 2].imshow(text_latent_images[0])
+                            axs[row_idx, 2].set_title(f"Text Latent\n{text_steps} steps")
+                            axs[row_idx, 2].axis('off')
+
+                        # Animation function for all rows, including the ground truth
+                        def update_ablation(frame):
+                            gt_im.set_array(gt_images[frame])
+                            for row_idx, (fused_images, image_latent_images, text_latent_images) in enumerate(
+                                zip(fused_images_list, image_latent_images_list, text_latent_images_list), start=1):
+                                axs[row_idx, 0].images[0].set_array(fused_images[frame])
+                                axs[row_idx, 1].images[0].set_array(image_latent_images[frame])
+                                axs[row_idx, 2].images[0].set_array(text_latent_images[frame])
+                            return [gt_im] + [im for row in axs[1:] for ax in row for im in ax.images]
+
+                        # Create animation for all rows
+                        ani = FuncAnimation(fig, update_ablation, frames=len(fused_images_list[0]), interval=200, blit=False)
+                        mode = model.fusion_mode
+                        model_path = MODEL_PATHS[mode*10]
+                        model_name = model_path.split('/')[-1].split('.')[0]
+                        gif_path = os.path.join(output_dir, f'sample_{sample_idx}_karras_all-{model_name}.gif')
+                        ani.save(gif_path, writer=PillowWriter(fps=10))
+                        print(f"Saved Karras ablation plot for sample {sample_idx} at {gif_path}")
+
+                        # Close the plot to free memory
+                        plt.close()
+            
+            else:
+                # Default demo procedure
+                model.image_karras_steps = 16
+                model.text_karras_steps = 16
+
+                # Get the predicted fused latents from the model
+                fused_latents, image_latents, text_latents = model.forward(
+                    images=images2,
+                    prompts=captions,
+                    remove_background=False
+                )
+
+                for j, fused_latent in enumerate(fused_latents):
+                    gt_gif_path = model.gif_path + '/' + f'sample_{j}_gt.gif'
+                    pred_gif_path = model.gif_path + '/' + f'sample_{j}_pred.gif'
+
+                    gt_images = decode_latent_images(model.xm, latent_codes[j], cameras, rendering_mode='nerf')
+                    pred_images = decode_latent_images(model.xm, fused_latent, cameras, rendering_mode='nerf')
+
+                    imageio.mimsave(gt_gif_path, gt_images, fps=10)  
+                    imageio.mimsave(pred_gif_path, pred_images, fps=10)  
+                    
+                    # Plotting
+                    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+                    fig.suptitle(captions[j], fontsize=10)  # Use the caption as the title
+
+                    # Input image
+                    axs[0].imshow(images2[j].cpu().permute(1, 2, 0))
+                    axs[0].set_title("Input Image")
+                    axs[0].axis('off')
+
+                    # Prepare placeholders for the animated images
+                    gt_im = axs[1].imshow(gt_images[0])
+                    pred_im = axs[2].imshow(pred_images[0])
+                    axs[1].set_title("Ground Truth")
+                    axs[1].axis('off')
+                    axs[2].set_title("Predicted")
+                    axs[2].axis('off')
+
+                    # Animation function
+                    def update(frame):
+                        gt_im.set_array(gt_images[frame])
+                        pred_im.set_array(pred_images[frame])
+                        return [gt_im, pred_im]
+
+                    # Create the animation
+                    ani = FuncAnimation(fig, update, frames=len(gt_images), interval=200, blit=True)
+                    mode = model.fusion_mode
+                    model_path = MODEL_PATHS[mode*10]
+                    model_name = model_path.split('/')[-1].split('.')[0]
+                    gif_path = os.path.join(output_dir, f'sample_{j}_comparison-{model_name}.gif')
+                    ani.save(gif_path, writer=PillowWriter(fps=10))
+                    print(f"Saved animated comparison plot for sample {j} at {gif_path}")
+
+                    # Close the plot to free memory
+                    plt.close()
+
+            break  # Process only the first batch for the demo
 
 
 # ========================================= General Demos =========================================
@@ -2188,11 +2513,12 @@ def main(FLAGS):
         model = ShapE(
                         input_mode=FLAGS.mode,
                         use_karras=True,
-                        karras_steps=16,
+                        karras_steps=32,
                         guidance_scale=15.0,
                         use_transmitter=True,
                         output_path='./output'
                     ).to(device)
+        print(f"karras_steps = {model.karras_steps}")
 
     else:
         print("Initializing MMShapE model...")
@@ -2201,31 +2527,31 @@ def main(FLAGS):
         #  1 -> Average fusion (not trainable),
         #  2 -> Cross-modal fusion,
         #  3 -> Cross-modal fusion at sequence level,
-        #  4 -> Gated fusion
+        #  4 -> Gated fusion,
+        #  5 -> Weighted fusion,
 
         model = MMShapE(
                         fusion_mode=FLAGS.mode,
                         use_karras=True,
-                        image_karras_steps=16,
-                        text_karras_steps=16,
+                        image_karras_steps=32,
+                        text_karras_steps=32,
                         latent_dim=1048576,
                         #reduced_dim=512,
                         reduced_dim=1024,
                         num_cm_heads=8,
                         use_transmitter=True,
+                        parallelize=FLAGS.parallelize,
                         output_path='./output'
                     ).to(device)
+        print(f"image_karras_steps = {model.image_karras_steps}")
+        print(f"text_karras_steps = {model.text_karras_steps}")
+        print(f"parallelize = {model.parallelize}")
 
 
         if FLAGS.load:
-            if FLAGS.dataset == "text2shape":
-                load_mode = FLAGS.mode
-            elif FLAGS.dataset == "objaverse":
-                load_mode = FLAGS.mode * 10
-            else:
-                raise ValueError(f"Invalid Dataset: '{FLAGS.dataset}' to load weights")
-            print(f"Loading {MODEL_PATHS[load_mode]} weights...")
-            model.load_state_dict(torch.load(MODEL_PATHS[load_mode]))
+            model_path = get_model_path(FLAGS.mode, FLAGS.dataset)
+            print(f"Loading {model_path} weights...")
+            model.load_state_dict(torch.load(model_path))
 
     print("Model: ", model)
     print("\n")
@@ -2263,7 +2589,7 @@ def main(FLAGS):
         if FLAGS.dataset == "text2shape":
             evaluate_text2shape(model, test_loader, device=device, fid_batch_size=30)
         elif FLAGS.dataset == "objaverse":
-            evaluate_objaverse(model, test_loader, device=device, fid_batch_size=30)
+            evaluate_objaverse(model, test_loader, device=device, fid_batch_size=30, text_ablation=FLAGS.text_ablation, karras_ablation=FLAGS.karras_ablation, test_parallelization=FLAGS.test_parallelization)
         else:
             raise ValueError(f"Invalid Dataset: '{FLAGS.dataset}' for evaluation")
 
@@ -2290,9 +2616,9 @@ def main(FLAGS):
         """
 
         if FLAGS.dataset == "text2shape":
-            demo_text2shape(model, test_loader, device=device, num_samples=FLAGS.n)
+            demo_text2shape(model, train_loader, device=device, num_samples=FLAGS.n)
         elif FLAGS.dataset == "objaverse":
-            demo_objaverse(model, test_loader, device, output_dir='./output/demos/')
+            demo_objaverse(model, train_loader, device, output_dir='./output/demos/', text_ablation=FLAGS.text_ablation, karras_ablation=FLAGS.karras_ablation)
         else:
             raise ValueError(f"Invalid Dataset: '{FLAGS.dataset}' for demo")
 
@@ -2323,6 +2649,7 @@ if __name__ == "__main__":
                         help='Objaverse csv file path mapping object ids to captions.')
     parser.add_argument('--obja_latent_dir',
                         type=str, default="/lustre/fs1/home/cap6411.student3/final_project/Cap3D/Cap3D_latentcodes/",
+                        #type=str, default="/lustre/fs1/home/cap6411.student3/final_project/Cap3D/uploaded_Cap3D_latentcodes/",
                         help='Objaverse directory storing Shap-E latent codes for objects having names "<object_id>.pt".')
     parser.add_argument('--n',
                         type=int, default=0,
@@ -2340,7 +2667,12 @@ if __name__ == "__main__":
                         * 2 -> Cross-modal fusion MM-Shap-E
                         * 3 -> Cross-modal fusion at sequence level MM-Shap-E
                         * 4 -> Gated fusion MM-Shap-E
+                        * 5 -> Weighted fusion MM-Shap-E
+                        * 6 -> Minor attention MM-Shap-E 
                         """)
+    parser.add_argument('--parallelize',
+                        action='store_true',
+                        help='An option to parallelize image and text latent diffusion models in late-fusion MM-Shap-E.')
     parser.add_argument('--load',
                         action='store_true',
                         help='An option to load weights before training, eval, or demo')
@@ -2361,10 +2693,22 @@ if __name__ == "__main__":
                         help='Run training loop.')
 
 
+    # ======= Eval and Demo Args =======
+    parser.add_argument('--text_ablation',
+                        action='store_true',
+                        help='Run text ablation variations of eval and/or demo.')
+    parser.add_argument('--karras_ablation',
+                        action='store_true',
+                        help='Run karras ablation variations of eval and/or demo.')
+
+
     # ======= Eval Args =======
     parser.add_argument('--eval',
                         action='store_true',
                         help='Run evaluation loop.')
+    parser.add_argument('--test_parallelization',
+                        action='store_true',
+                        help='Run evaluation with and without late fusion parallelization.')
 
     # ======= Demo Args =======
     parser.add_argument('--demo',
