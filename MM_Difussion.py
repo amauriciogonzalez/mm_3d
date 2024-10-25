@@ -4,7 +4,7 @@ from shap_e.models.generation.transformer import PointDiffusionTransformer
 from shap_e.models.generation.pretrained_clip import ImageCLIP, FrozenImageCLIP, ImageType
 from shap_e.models.generation.util import timestep_embedding
 import math
-from typing import Optional, Iterable, Union
+from typing import Optional, Iterable, Union, Dict, Any
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -55,7 +55,7 @@ class combinedCLIP(PointDiffusionTransformer):
         self.device = device
         self.n_ctx = n_ctx
         self.clip = clip
-
+        print(self.backbone.width)
         self.clip_embed = nn.Linear(
             self.clip.feature_dim, self.backbone.width, device=device, dtype=dtype
         )
@@ -69,17 +69,16 @@ class combinedCLIP(PointDiffusionTransformer):
 
         self.cond_drop_prob = cond_drop_prob
 
-        # if self.text:
-        #     def cached_model_kwargs(self, batch_size: int, model_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        #         with torch.no_grad():
-        #             return dict(embeddings=self.clip(batch_size, **model_kwargs))
-        #
-        # else:
-        #     def cached_model_kwargs(self, batch_size: int, model_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        #         _ = batch_size
-        #         with torch.no_grad():
-        #             return dict(embeddings=self.clip.embed_images_grid(model_kwargs["images"]))
-        #
+
+    def cached_model_kwargs(self, batch_size: int, model_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        _ = batch_size
+        # print(model_kwargs)
+        model_kwargs_txt = {"texts": model_kwargs["texts"]}
+        with torch.no_grad():
+            return dict(embeddings=self.clip(batch_size, **model_kwargs_txt),
+                        embeddings_img=self.clip.embed_images_grid(model_kwargs["images"]))
+
+
 
     def forward(
             self,
@@ -102,9 +101,11 @@ class combinedCLIP(PointDiffusionTransformer):
         assert images is None or embeddings is None, "cannot specify both images and embeddings"
         assert x.shape[-1] == self.n_ctx
 
+
         t_embed = self.time_embed(timestep_embedding(t, self.backbone.width))
 
         clip_out = self.clip(batch_size=len(x), images=images, texts=texts, embeddings=embeddings)
+
         if images is not None:
             clip_out_img = self.clip.embed_images_grid(images)
         else:
@@ -119,12 +120,24 @@ class combinedCLIP(PointDiffusionTransformer):
         clip_out = math.sqrt(clip_out.shape[1]) * clip_out
         clip_out_img = clip_out_img.permute(0, 2, 1)  # NCL -> NLC
 
+
         clip_embed_img = self.clip_embed_img(clip_out_img)
         clip_embed = self.clip_embed(clip_out)
+        # print("clip_embed")
+        # print(clip_embed.shape)
+        # print(clip_embed_img.shape)
+        # print("t_embed")
+        # print(t_embed.shape)
+        # print(self.time_token_cond)
+        # print("clip_embed")
 
         clip_embed = cross_modal(clip_embed_img, clip_embed)
 
-        print(clip_embed.shape)
+        # clip_embed.unsqueeze_(1)
+        # print(clip_embed_img.shape)
+        # print(clip_embed.shape)
+        # clip_embed = (clip_embed_img + clip_embed) / 2
+        # print(clip_embed.shape)
         cond = [(t_embed, self.time_token_cond), (clip_embed, True)]
 
         return self._forward_with_cond(x, cond)
