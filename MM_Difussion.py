@@ -8,6 +8,9 @@ from typing import Optional, Iterable, Union, Dict, Any
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ================================= Early Fusion Mechanisms =================================
+
+# Fusion mode 200's
 class CrossModalAttention(nn.Module):
     def __init__(self, dim):
         super(CrossModalAttention, self).__init__()
@@ -28,15 +31,38 @@ class CrossModalAttention(nn.Module):
         return output
 
 
-cross_modal = CrossModalAttention(1024).to(device)
+# Fusion mode 300's
+class RowWiseGatedFusionModule(nn.Module):
+    def __init__(self, feature_dim):
+        super(RowWiseGatedFusionModule, self).__init__()
+        # Gating mechanism for interaction
+        self.gate = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, img_features, text_features):
+        # img_features: [batch_size, 1024, 256]
+        # text_features: [batch_size, 1024]
+        
+        # Apply gate to text features
+        gated_text = self.gate(text_features)  # [batch_size, 1024]
+        
+        # Element-wise multiplication of gated text with each row of img_features
+        fused_output = img_features * gated_text.unsqueeze(1)  # Broadcast along 1024 rows
+        
+        return fused_output
+
+
+# ================================= Multimodal Model =================================
 
 class combinedCLIP(PointDiffusionTransformer):
-
     def __init__(
             self,
             *,
             device: torch.device,
             dtype: torch.dtype,
+            fusion_mode: int = 200,
             n_ctx: int = 1024,
             cond_drop_prob: float = 0.0,
             token_cond: bool = False,
@@ -53,9 +79,10 @@ class combinedCLIP(PointDiffusionTransformer):
             **kwargs,
         )
         self.device = device
+        self.fusion_mode = fusion_mode
         self.n_ctx = n_ctx
         self.clip = clip
-        print(self.backbone.width)
+        #print(self.backbone.width)
         self.clip_embed = nn.Linear(
             self.clip.feature_dim, self.backbone.width, device=device, dtype=dtype
         )
@@ -66,6 +93,11 @@ class combinedCLIP(PointDiffusionTransformer):
             ),
             nn.Linear(self.clip.grid_feature_dim, self.backbone.width, device=device, dtype=dtype),
         )
+
+        if self.fusion_mode < 200:
+            self.cross_modal = CrossModalAttention(1024).to(device)
+        elif self.fusion_mode < 300:
+            self.gated_fusion = RowWiseGatedFusionModule(1024).to(device)
 
         self.cond_drop_prob = cond_drop_prob
 
@@ -131,7 +163,12 @@ class combinedCLIP(PointDiffusionTransformer):
         # print(self.time_token_cond)
         # print("clip_embed")
 
-        clip_embed = cross_modal(clip_embed_img, clip_embed)
+
+        if self.fusion_mode < 200:
+            clip_embed = self.cross_modal(clip_embed_img, clip_embed)
+        elif self.fusion_mode < 300:
+            clip_embed = self.gated_fusion(clip_embed_img, clip_embed)
+
 
         # clip_embed.unsqueeze_(1)
         # print(clip_embed_img.shape)
