@@ -79,8 +79,8 @@ pip install -r requirements.txt
 
 ### Ablation Options
 
---`text_ablation`: Runs text ablation variations in evaluation/demo.
---`karras_ablation`: Runs Karras ablation variations in evaluation/demo.
+- `--text_ablation`: Runs text ablation variations in evaluation/demo.
+- `--karras_ablation`: Runs Karras ablation variations in evaluation/demo.
 
 ### Demo
 
