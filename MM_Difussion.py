@@ -10,7 +10,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ================================= Early Fusion Mechanisms =================================
 
-# Fusion mode 200's
+# Fusion mode 100's
 class CrossModalAttention(nn.Module):
     def __init__(self, dim):
         super(CrossModalAttention, self).__init__()
@@ -31,7 +31,7 @@ class CrossModalAttention(nn.Module):
         return output
 
 
-# Fusion mode 300's
+# Fusion mode 200's
 class RowWiseGatedFusionModule(nn.Module):
     def __init__(self, feature_dim):
         super(RowWiseGatedFusionModule, self).__init__()
@@ -51,6 +51,51 @@ class RowWiseGatedFusionModule(nn.Module):
         # Element-wise multiplication of gated text with each row of img_features
         fused_output = img_features * gated_text.unsqueeze(1)  # Broadcast along 1024 rows
         
+        return fused_output
+
+
+# Fusion mode 300's
+class AttentionTextGuidedFusion(nn.Module):
+    def __init__(self, img_feature_dim):
+        super(AttentionTextGuidedFusion, self).__init__()
+        
+        # Linear layers to transform image and text features
+        self.query = nn.Linear(img_feature_dim, img_feature_dim)
+        self.key = nn.Linear(img_feature_dim, img_feature_dim)
+        self.value = nn.Linear(img_feature_dim, img_feature_dim)
+        
+        
+        # Multihead attention with batch_first=True
+        self.multihead_attn = nn.MultiheadAttention(embed_dim=img_feature_dim, num_heads=1, batch_first=True)
+        
+        # Learnable scaling factor for controlling the impact of attention
+        self.attn_scale = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        
+        # Initialize weights to zero for query, key, and value transforms
+        nn.init.zeros_(self.query.weight)
+        nn.init.zeros_(self.key.weight)
+        nn.init.zeros_(self.value.weight)
+
+    def forward(self, img_features, text_features):
+        # img_features: [batch_size, 1024, img_feature_dim]
+        # text_features: [batch_size, 1024, img_feature_dim]
+
+        # Transform the image and text features into query, key, and value
+        query = self.query(img_features)
+        key = self.key(text_features)
+        key = key.unsqueeze(1)
+        value = self.value(text_features)
+        value = value.unsqueeze(1)
+
+        # Apply multi-head attention: text features attend to the image features
+        attn_output, _ = self.multihead_attn(query, key, value)
+
+        # Use the scaling factor to modulate the impact of attention
+        attn_output = self.attn_scale * attn_output
+
+        # Combine the scaled attended features with the original image features
+        fused_output = img_features + attn_output
+
         return fused_output
 
 
@@ -98,6 +143,8 @@ class combinedCLIP(PointDiffusionTransformer):
             self.cross_modal = CrossModalAttention(1024).to(device)
         elif self.fusion_mode < 300:
             self.gated_fusion = RowWiseGatedFusionModule(1024).to(device)
+        elif self.fusion_mode < 400:
+            self.attention_text_guided_fusion = AttentionTextGuidedFusion(img_feature_dim=1024).to(device)
 
         self.cond_drop_prob = cond_drop_prob
 
@@ -168,7 +215,8 @@ class combinedCLIP(PointDiffusionTransformer):
             clip_embed = self.cross_modal(clip_embed_img, clip_embed)
         elif self.fusion_mode < 300:
             clip_embed = self.gated_fusion(clip_embed_img, clip_embed)
-
+        elif self.fusion_mode < 400:
+            clip_embed = self.attention_text_guided_fusion(clip_embed_img, clip_embed)
 
         # clip_embed.unsqueeze_(1)
         # print(clip_embed_img.shape)
