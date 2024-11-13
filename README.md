@@ -1,7 +1,5 @@
 # MM-Shap-E: A Multimodal Text-and-Image-to-3D Pipeline
 
-*This README is subject to change as the project progresses*
-
 
 ## Setup
 
@@ -30,6 +28,10 @@ source env/bin/activate
 ```bash   
 pip install -r requirements.txt
 ```
+
+4. **Download Weights**:
+* [Late Weighted Fusion MM-Shap-E](https://drive.google.com/file/d/1cKARhprqepM3pVqgCvqS3PZWK7bo_Nl3/view?usp=sharing)
+* [Early Text-Guided Fusion MM-Shap-E](https://drive.google.com/file/d/1mxgzz_lFwf9BQ890B0TBLgaepYG3gJeB/view?usp=sharing)
 
 
 
