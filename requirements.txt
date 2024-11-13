@@ -109,6 +109,7 @@ scikit-image==0.24.0
 scikit-learn==1.5.2
 scipy==1.14.1
 sentence-transformers==3.1.1
+-e git+https://github.com/openai/shap-e.git@50131012ee11c9d2617f3886c10f000d3c7a3b43#egg=shap_e
 six==1.16.0
 sorcery==0.2.2
 soupsieve==2.6
