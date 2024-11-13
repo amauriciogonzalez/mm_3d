@@ -15,8 +15,6 @@ from shap_e.models.transmitter.base import Transmitter, VectorDecoder
 from shap_e.models.generation.latent_diffusion import SplitVectorDiffusion
 from MM_Difussion import combinedCLIP
 
-from torchviz import make_dot
-
 import imageio
 import numpy as np
 from PIL import Image, ImageEnhance
